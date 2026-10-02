@@ -1,0 +1,2843 @@
+---
+title: "Targeted urine metabolomics analysis"
+author: "Rafael Riudavets Puig"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: simplex
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Targeted urine GC-MS data
+
+This notebook contains the steps for the analysis of the targeted GC-MS urine metabolomics data of the Lactobreath project.
+
+## Library loading
+
+Below are all the required libraries for the script.
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(readxl)
+library(writexl)
+library(FactoMineR)
+library(reshape2)
+library(ggplot2)
+library(stringr)
+library(rstatix)
+library(purrr)
+library(forcats)
+library(nparLD)
+library(ggpubr)
+library(ComplexHeatmap)
+library(gridExtra)
+library(cowplot)
+library(rmarkdown)
+library(FSA)
+library(lme4)
+library(lmerTest)
+library(tidyr)
+library(dplyr)
+library(this.path)
+```
+
+<!-- ## Sourcing some functions and setting general variables -->
+
+```{r sourcing}
+setwd(this.dir())
+source("urine_metabolome_utils.R")
+
+# Define output directories for results
+output_dir = file.path(getwd(), "results")
+raw_results_dir = file.path(output_dir, "raw_data")
+plots_dir = file.path(output_dir, "plots")
+descriptive_plots_dir = file.path(plots_dir, "cohort_descriptives")
+qc_plots_dir = file.path(plots_dir, "qc_plots")
+eda_plots_dir = file.path(plots_dir, "EDA_plots")
+dea_dir = file.path(output_dir, "DEA")
+pub_dir = file.path(output_dir, "pub_plots") #Plots for publication
+
+dirs = c(output_dir, raw_results_dir, plots_dir, descriptive_plots_dir, qc_plots_dir, eda_plots_dir, dea_dir)
+
+
+for (d in dirs) {
+  if (!dir.exists(d)) {
+    dir.create(d, recursive = TRUE)
+  }
+}
+```
+
+## Reading and preparing the input data
+
+The input data are multiple excel files - one for each batch. While reading it, we want turn the two-level column title system into one level. After reading it, we start by adding some information like the batch, injection order, and type of sample.
+
+```{r reading, message = FALSE, warning = FALSE}
+# Import list of files
+raw_path <- file.path(this.dir(), "raw_data")
+files = list.files(raw_path, pattern = "^Batch.*\\.xlsx$", full.names = TRUE)
+
+# Transform two-level column titles to one-level
+batches = lapply(files, function(x) {clean_headers(x, remove_second_lactose_peak = TRUE)})
+
+# Put all batches into one data frame
+data = do.call(rbind, batches)
+# Order data by injection time and create injection order column
+data$injection_order = as.numeric(sapply(strsplit(data$`Data File`, "_"), "[[", 1))
+data = data[order(data$injection_order, decreasing = FALSE), ]
+
+# Define sample type (overwrite the already existing column in raw data)
+data = data %>%
+  mutate(
+    Type = case_when(
+      grepl("^[0-9]", Name) ~ "Sample",
+      grepl("QC", Name) ~ "QC",
+      grepl("^Std", Name) ~ "Std",
+      grepl("blank", Name, ignore.case = TRUE) ~ "Blank",
+      grepl("^Bla", Name) ~ "Blank",
+      TRUE ~ "NA"
+    ),
+    batch = factor(batch, levels = as.character(sort(as.numeric(unique(batch)))))
+  ) %>%
+  filter(!grepl("_Eq", Name))
+
+# Add an extra number to the standard Name so that we know if it's the first or second
+# standard round within a batch
+# Batch 16 got some extra standards at the higher range
+standard_order_nums = rep(rep(1:2, each = 6), 15)
+standard_order_nums = c(standard_order_nums, rep(1:2, each = 9))
+# Batch 17 has again 6 standards
+standard_order_nums = c(standard_order_nums, rep(1:2, each = 6))
+data$Name[grep("Std_", data$Name)] = paste0(data$Name[grep("Std_", data$Name)], "_", standard_order_nums)
+
+# Convert response columns to numeric
+# Also convert NAs to 0 to avoid NA propagation
+data[grep("Resp.", colnames(data), fixed = TRUE)] = lapply(data[grep("Resp.", colnames(data), fixed = TRUE)], function(x) {
+  num = as.numeric(gsub(",", "", x))
+  num[is.na(num)] = 0
+  return(num)
+})
+
+# Remove column that contains no information
+data = data[, -grep("Level", colnames(data))]
+
+# Filter out samples that were repeated in batches 16 and 17 due to low quality
+repeated_samples = data %>% 
+  filter(batch %in% c(16, 17)) %>%
+  filter(Type == "Sample") %>%
+  mutate(Name = gsub("_rep", "", Name)) %>%
+  pull(Name)
+
+# Finish preparing and filter LB122 because it does not have a baseline sample
+data = data %>%
+  filter(!Name %in% repeated_samples) %>%
+  mutate(Name = gsub("_rep", "", Name)) %>%
+  filter(Name != "QC16e") %>%
+  filter(!grepl("122_", Name))
+
+write.table(
+  data,
+  file.path(raw_results_dir, "1_prepared_raw_data.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r show_raw_data}
+paged_table(data)
+```
+
+## Descriptive statistics {.tabset}
+
+Now, we will describe the data set in terms of amounts of participants from each group, sex, distribution among batches, etc. Overall, we see a very good distribution of all screen groups and timepoints in each batch, hooray! :D
+
+```{r descriptive_statistics, message = FALSE, warning = FALSE}
+full_metadata <- read.delim("full_metadata.tsv")
+
+metadata_new = read.csv(file.path(getwd(),"UrineGCMSAnalysisMetadata_20260430.csv"))
+metadata_new = metadata_new %>%
+  mutate(study_id_lb = gsub("_", "", study_id_lb)) #LB_XXX --> LBXXX
+metadata_old = read_excel(file.path(getwd(), "UrineGCMSAnalysisMetadata_20250505.xlsx")) 
+# Upload metadata from pretest because manual corrections were carried out here for first 5 participants; see "Correction_fluid_consumption_first_five_participants.docx" for context
+ids_corr = unique(metadata_old$study_id_lb)
+metadata_new = metadata_new %>%
+  filter(!study_id_lb %in% ids_corr)
+# setdiff(names(metadata_old), names(metadata_new))
+common_cols = intersect(names(metadata_new), names(metadata_old))
+metadata_old_clean = metadata_old[, common_cols]
+metadata_new_clean = metadata_new[, common_cols]
+time_cols = grep(
+  "time",
+  names(metadata_new),
+  ignore.case = TRUE, 
+  value = TRUE
+)
+metadata_new[time_cols] = lapply(metadata_new[time_cols], as.character)
+metadata_old[time_cols] = lapply(metadata_old[time_cols], as.character)
+metadata = bind_rows(metadata_new, metadata_old)
+
+unblinding = read_excel(file.path(getwd(), "List_unblinding_final.xlsx"), col_names = FALSE)
+colnames(unblinding) = c("int_group", "study_id_lb")
+
+mapping = data %>%
+  mutate(
+    Name = Name,
+    batch = batch,
+    Type = Type,
+  # Extract study ID where "Type" is a sample
+    extracted_digits = if_else(
+      Type == "Sample",
+      str_extract(Name, "^[0-9]+"),
+      NA_character_),
+    study_id_lb = if_else(
+      !is.na(extracted_digits),
+      paste0("LB", str_pad(extracted_digits, width = 3, pad = "0")),
+      NA_character_)
+  ) %>%
+  dplyr::select(study_id_lb, Name, Type, batch) %>%
+  left_join(metadata[, c("study_id_lb", "screen_group", "sex")], by = "study_id_lb") %>%
+  left_join(unblinding, by = "study_id_lb") %>% 
+  left_join(full_metadata %>% select(study_id, gen_test_rs4988235, ibs_sss_score), by = join_by("study_id_lb" == "study_id")) %>%
+  mutate(
+    timepoint = factor(case_when(
+      grepl("AH", Name) ~ "At-home",
+      grepl("BL", Name) ~ "Baseline",
+      grepl("0-3", Name) ~ "0-3h",
+      grepl("3-6", Name) ~ "3-6h")),
+    screen_group = factor(case_when(
+      screen_group == 1 ~ "Control",
+      screen_group == 2 ~ "LM-A",
+      screen_group == 3 ~ "LM-S"
+    ), levels = c("Control", "LM-A", "LM-S")),
+    batch = factor(batch),
+    treatment = factor(case_when(
+      int_group == "Treatment A" ~ "Lactose",
+      int_group == "Treatment B" ~ "Glucose"
+    ), levels = c("Lactose", "Glucose")),
+    gen_test_rs4988235 = factor(gen_test_rs4988235, levels = c("TT", "CT", "CC"))
+  )
+
+write.table(
+  mapping,
+  file.path(raw_results_dir, "2_mapping.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+data = data %>%
+  mutate(
+    batch = factor(batch)
+  )
+
+# Number of sample types
+samples_per_batch = data %>%
+    group_by(batch) %>%
+    summarise(Count = n()) %>%
+    ggplot(aes(x = batch, y = Count, fill = batch)) + 
+        geom_bar(stat = "identity", position = "dodge") +
+        ggtitle("Count of samples per batch") +
+        theme_light()
+
+samples_per_type = data %>%
+    group_by(Type, batch) %>%
+    summarise(Count = n()) %>%
+    ggplot(aes(x = Type, y = Count, fill = batch)) + 
+        geom_bar(stat = "identity", position = "dodge") +
+        ggtitle("Count of samples per type") +
+        xlab("Sample type") +
+        ylab("Count") +
+        theme_light()
+
+# Are the groups spread evenly across batches?
+samples_per_batch_and_screen_group = data %>% 
+    filter(Type == "Sample") %>%
+    left_join(mapping, by = "Name") %>%
+    group_by(screen_group, batch.x) %>%
+    summarise(n = n()) %>%
+    ggplot(aes(x = batch.x, y = n, fill = screen_group)) +
+        geom_bar(stat = "identity", position = "dodge") +
+        ggtitle("Count of samples per batch and screen group") +
+        xlab("Batch") +
+        ylab("Count") +
+        guides(
+          fill = guide_legend(title = "Screen group")
+        ) +
+        scale_fill_manual(
+          values = c(
+            "Control" = "#619CFF",
+            "LM-A" = "#00BA38",
+            "LM-S" = "#F8766D"
+          )
+        ) +
+        theme_light()
+
+# Are the groups spread evenly across batches, including timepoints?
+samples_per_batch_and_screen_group_and_timepoint = data %>% 
+    filter(Type == "Sample") %>%
+    left_join(mapping, by = "Name") %>%
+    group_by(screen_group, timepoint, batch.x) %>%
+    summarise(n = n()) %>%
+    ggplot(aes(x = batch.x, y = n, fill = screen_group)) +
+        geom_bar(stat = "identity", position = "dodge") +
+        ggtitle("Count of samples per batch and screen group by time point") +
+        xlab("Batch") +
+        ylab("Count") +
+        facet_grid(timepoint ~ .) +
+        guides(
+          fill = guide_legend(title = "Screen group")
+        ) +
+        scale_fill_manual(
+          values = c(
+            "Control" = "#619CFF",
+            "LM-A" = "#00BA38",
+            "LM-S" = "#F8766D"
+          )
+        ) +
+        theme_light()
+
+# Are the groups spread evenly across batches, including timepoints?
+samples_per_batch_and_screen_group_and_treatment = data %>% 
+    filter(Type == "Sample") %>%
+    left_join(mapping, by = "Name") %>%
+    group_by(screen_group, treatment, batch.x) %>%
+    summarise(n = n()) %>%
+    ggplot(aes(x = batch.x, y = n, fill = screen_group)) +
+        geom_bar(stat = "identity", position = "dodge") +
+        ggtitle("Count of samples per batch and screen group by treatment") +
+        xlab("Batch") +
+        ylab("Count") +
+        facet_grid(treatment ~ .) +
+        guides(
+          fill = guide_legend(title = "Screen group")
+        ) +
+        scale_fill_manual(
+          values = c(
+            "Control" = "#619CFF",
+            "LM-A" = "#00BA38",
+            "LM-S" = "#F8766D"
+          )
+        ) +
+        theme_light()
+```
+
+### Samples per batch
+
+```{r message = FALSE, fig.align = "center"}
+ggsave(file.path(descriptive_plots_dir, "samples_per_batch.pdf"), samples_per_batch)
+samples_per_batch
+```
+
+### Samples per type
+
+```{r message = FALSE, fig.align = "center"}
+ggsave(file.path(descriptive_plots_dir, "samples_per_type.pdf"), samples_per_type)
+samples_per_type
+```
+
+### Samples per batch and screen group
+
+```{r message = FALSE,  fig.align = "center"}
+ggsave(file.path(descriptive_plots_dir, "samples_per_batch_and_screen_group.pdf"), samples_per_batch_and_screen_group)
+samples_per_batch_and_screen_group
+```
+
+### Samples per batch, time point, and screening group
+
+```{r message = FALSE,  fig.align = "center"}
+ggsave(file.path(descriptive_plots_dir, "samples_per_batch_and_screen_group_and_timepoint.pdf"), samples_per_batch_and_screen_group_and_timepoint)
+samples_per_batch_and_screen_group_and_timepoint
+```
+
+### Samples per batch, screen group, and treatment
+
+```{r message = FALSE,  fig.align = "center"}
+ggsave(file.path(descriptive_plots_dir, "samples_per_batch_and_screen_group_and_treatment.pdf"), samples_per_batch_and_screen_group_and_treatment)
+samples_per_batch_and_screen_group_and_treatment
+```
+
+## First quality check
+
+As a first check, we will plot the distribution of the data for the different QC samples, coloring by batch to see if there are any clear differences.
+
+```{r first_qc, fig.width = 14, fig.height = 14, warning = FALSE, message = FALSE}
+response_colnames = c(
+    "1,4-Galactonolactone Resp.",
+    "Galactose Pk1 Resp.",
+    "Galactose Pk2 Resp.",
+    "Galactitol Resp.",
+    "1,5-Galactonolactone Resp.",
+    "Galactonate Resp.",
+    "Lactose Pk1 Resp.",
+    "Lactose Pk2 Resp.",
+    "IStd Xylose Resp."
+)
+
+distribution_before_norm = data %>%
+  filter(Type == "QC") %>%
+  select(all_of(c("batch", "Type", response_colnames))) %>%
+  pivot_longer(!c("batch", "Type"), names_to = "metabolite", values_to = "intensity") %>%
+  mutate(logint = log(intensity + 1)) %>%
+  ggplot(aes(x = logint, color = batch)) +
+    geom_density() +
+    ggtitle("Before normalization with internal standard") +
+    xlab("log(Intensity)") +
+    ylab("Density") +
+    theme_light() +
+    facet_grid(metabolite ~ ., scales = "free_y")
+```
+
+```{r warning = FALSE, message = FALSE, fig.width = 8, fig.height = 8, fig.align = "center"}
+ggsave(file.path(qc_plots_dir, "1_distribution_before_norm.pdf"), distribution_before_norm)
+distribution_before_norm
+```
+
+We seem to have 2-3 main groups of batches, so we will need to account for that. Let's keep that in mind when we look at the intensity of the internal standard (Xylose) over injection order.
+
+```{r istd_drift, message = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+standard_data = data %>%
+  select(`IStd Xylose Resp.`, injection_order, batch, Type) %>%
+  mutate(order = order(injection_order))
+
+standard_drift = standard_data %>% filter(Type == "QC") %>%
+  ggplot(aes(x = order, y = `IStd Xylose Resp.`, color = batch)) + 
+    geom_point() +
+    xlab("Injection order") +
+    ylab("Intensity") +
+    ggtitle("Internal standard intensity in QC samples") +
+    # facet_grid(Type ~ ., scales = "free_y") +
+    theme_light()
+
+ggsave(file.path(qc_plots_dir, "istd_drift.pdf"), standard_drift)
+standard_drift
+```
+
+We see clear batch effects when focusing on the QC row. More specifically, we see:
+
+- Batches 1-4 show similar intensities for the internal standard.
+- Batch 5 seems to show two sub-batches, where the first sub-batch behaves as batches 1-4 and the second one shows a sudden increase in intensity. This observation remains the same for all other target compounds (see plot below).
+- Batches 6-10 show similar intensities to the second sub-batch of batch 5.
+- Batch 11 seems to show again two sub-batches, with the first one showing higher intensities and the second one showing lower intensities.
+- Batches 12-14 behave similarly, but with a mild but continuous decrease in intensity.
+- Batches 15-16 show a decrease and then increase of intensities. It is worth noting that these last two batches were run much later on.
+- Batch 17 shows lower intensities in general.
+
+We can also look at the target compound intensities in the QC samples:
+
+```{r message = FALSE, fig.width = 8, fig.height = 8, fig.align = "center"}
+compounds_drift = data %>% 
+  select(all_of(c("Type", "batch", "injection_order", response_colnames))) %>% 
+  pivot_longer(
+    !c("Type", "batch", "injection_order"),
+    names_to = "metabolite",
+    values_to = "intensity"
+  ) %>% 
+  mutate(
+    order = order(injection_order),
+    logint = log(intensity + 1)
+  ) %>% 
+  filter(Type == "QC") %>%
+  ggplot(aes(x = order, y = logint, color = batch)) + 
+    geom_point() + 
+    ggtitle("Peak intensities in QC samples") +
+    facet_grid(metabolite ~ ., scales = "free_y") + 
+    theme_light()
+
+ggsave(file.path(qc_plots_dir, "compounds_drift.pdf"), compounds_drift)
+compounds_drift
+```
+
+While most target peaks show the same trend as Xylose, the lactose peaks seem to be a bit different. More specifically, we see:
+
+- In all non-lactose peaks, intensities behave like Xylose.
+- In both lactose peaks, intensities go down at the beginning of batch 5 followed by jumping back up. In addition, lactose peak 1 stays higher than batches 1-4, while lactose peak 2 goes back to similar intensities. These observations are important, as this implies that normalizing through dividing by the Xylose value will affect these peaks differently. However, if we make sure that we use the correct quantification curves for each sample, we should be able to mitigate this effect.
+- Again, the last two batches behave differently due to having been run quite later.
+
+Altogether, these observations suggest that we should manually assign each sample to its most representative standard curve to make sure we remove most of these effects at the quantification step.
+
+## Normalization using the internal standard (Xylose)
+
+We will first normalize the data using the internal standard. Each metabolite value for each sample is divided by its corresponding Xylose value. This allows us to control variability coming from changes in instrument sensitivity through time. Since the concentration of Xylose is the same across all runs, we are essentially changing the response values to their intensities relative to the Xylose intensity.
+
+```{r istd_norm, fig.height = 8, fig.width = 8, fig.align = "center", message = FALSE, warning = FALSE}
+colnames_to_divide = c(
+    "1,4-Galactonolactone Resp.",
+    "Galactose Pk1 Resp.",
+    "Galactose Pk2 Resp.",
+    "Galactitol Resp.",
+    "1,5-Galactonolactone Resp.",
+    "Galactonate Resp.",
+    "Lactose Pk1 Resp.",
+    "Lactose Pk2 Resp.",
+    "IStd Xylose Resp."
+)
+columns_to_divide = which(
+  colnames(data) %in% colnames_to_divide
+)
+
+colname_divisor_column = "IStd Xylose Resp."
+divisor_column = which(colnames(data) %in% colname_divisor_column) # Column with areas under the curve of internal standard
+
+data_norm = data %>% #Division by internal standard and correction for resulting small numbers
+  mutate(
+    across(
+        .cols = (columns_to_divide),
+        ~ . / data[[divisor_column]]
+    ) * 1000000)
+
+write.table(
+  data_norm,
+  file.path(raw_results_dir, "3_internal_standard_normalized.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r }
+paged_table(data_norm)
+```
+
+We can check how the distributions have changed after the normalization using the internal standard.
+
+```{r istd_norm_qc, fig.width = 8, fig.height = 8, fig.align = "center", warning = FALSE, message = FALSE}
+distribution_after_norm = data_norm %>%
+  filter(Type == "QC") %>%
+  select(all_of(c("batch", "Type", colnames_to_divide, colname_divisor_column))) %>%
+  pivot_longer(!c("batch", "Type"), names_to = "metabolite", values_to = "intensity") %>%
+  mutate(logint = log(intensity + 1)) %>%
+  ggplot(aes(x = logint, color = batch)) +
+    geom_density() +
+    ggtitle("Peak intensity in QC samples after normalization with internal standard") +
+    xlab("log(Intensity)") +
+    ylab("Density") +
+    theme_light() +
+    facet_grid(metabolite ~ ., scales = "free_y")
+
+ggsave(file.path(qc_plots_dir, "2_distribution_after_norm.pdf"), distribution_after_norm)
+distribution_after_norm
+```
+
+We see that batch effects are still visible. We can also check the drift of the targeted metabolites before and after normalization to see how it worked.
+
+```{r drifts_qc, message = FALSE, warning = FALSE}
+drift_before_norm = data %>%
+  select(c(batch, injection_order, Type, colnames_to_divide)) %>%
+  mutate(order = order(injection_order, decreasing = FALSE)) %>%
+  pivot_longer(!c("batch", "order", "injection_order", "Type"), names_to = "metabolite", values_to = "intensity") %>%
+  mutate(logint = log(intensity + 1)) %>%
+  ggplot(aes(x = order, y = logint, color = batch, group = batch)) +
+    geom_line() +
+    ggtitle("Before internal standard normalization") +
+    facet_grid(metabolite ~ Type, scales = "free_y") +
+    theme_light()
+
+drift_after_norm = data_norm %>%
+  select(c(batch, injection_order, Type, colnames_to_divide)) %>%
+  mutate(order = order(injection_order, decreasing = FALSE)) %>%
+  pivot_longer(!c("batch", "order", "injection_order", "Type"), names_to = "metabolite", values_to = "intensity") %>%
+  mutate(logint = log(intensity + 1)) %>%
+  ggplot(aes(x = order, y = logint, color = batch, group = batch)) +
+    geom_line() +
+    ggtitle("After internal standard normalization") +
+    facet_grid(metabolite ~ Type, scales = "free_y") +
+    theme_light()
+```
+
+```{r message = FALSE, fig.width = 8, fig.height = 8, fig.align = "center"}
+ggsave(file.path(qc_plots_dir, "drifts_before_norm.pdf"), drift_before_norm)
+ggsave(file.path(qc_plots_dir, "drifts_after_norm.pdf"), drift_after_norm)
+drift_before_norm
+drift_after_norm
+```
+
+If we focus on the QC and Std columns, we can see how the values are much more stable after the normalization. However, if we compare the two we see again that something happened in the middle of batch 5. I believe this is still observed after normalization, where we see that the beginning and end of batch 5 are slightly different.
+
+In addition, the first and second standards for batches 4 and 5 show some slight differences. Once again, this suggests it may be better to quantify using a sample's closest standard.
+
+## Blank subtraction
+
+When looking at the standard drift over injection order, we see that blank samples also go up in the second group of samples. Therefore, we will remove the blank from each target compound prior to normalization with internal standard. Since we observed that there is a split in batch 5, we will make sure to correctly pair each sample to their most similar blank measurement. The code chunk below does the following:
+
+- Computes each sample's closest blank.
+- For each metabolite in each sample, it subtracts the blank measurement. When this subtraction results in a value \< 0, the result is returned as 0.
+
+```{r blank_subtraction}
+blank_data = data_norm %>%
+  filter(Type == "Blank") %>%
+  select(all_of(c("batch", "injection_order", "Name", response_colnames)))
+colnames(blank_data)[4:ncol(blank_data)] = paste0("blank_", colnames(blank_data)[4:ncol(blank_data)])
+
+measurement_to_blank_mapping = data %>%
+  filter(Type != "Blank") %>%
+  select(Name, injection_order)
+
+measurement_to_blank_mapping$corresponding_blank = sapply(measurement_to_blank_mapping$injection_order, function(x) {
+  diffs = abs(x - blank_data$injection_order)
+  closest_blank = blank_data$Name[which.min(diffs)]
+  return(closest_blank)
+})
+
+measurement_to_blank_mapping = measurement_to_blank_mapping %>%
+  inner_join(blank_data, by = join_by("corresponding_blank" == "Name"))
+
+col_idx_to_keep = c(
+  grep("Name", colnames(measurement_to_blank_mapping)),
+  grep("corresponding_blank", colnames(measurement_to_blank_mapping)),
+  grep("batch", colnames(measurement_to_blank_mapping)),
+  grep("blank_", colnames(measurement_to_blank_mapping))
+)
+
+measurement_to_blank_mapping = measurement_to_blank_mapping[, col_idx_to_keep]
+
+measurement_to_blank_mapping$join_col = paste0(measurement_to_blank_mapping$batch, "-", measurement_to_blank_mapping$Name)
+
+blank_corrected = data_norm %>%
+  mutate(
+    join_col = paste0(batch, "-", Name)
+  ) %>%
+  inner_join(measurement_to_blank_mapping, by = "join_col") %>%
+  mutate(
+    `1,4-Galactonolactone Resp.` = ifelse(
+      `1,4-Galactonolactone Resp.` - `blank_1,4-Galactonolactone Resp.` < 0,
+      0,
+      `1,4-Galactonolactone Resp.` - `blank_1,4-Galactonolactone Resp.`
+    ),
+    `Galactose Pk1 Resp.` = ifelse(
+      `Galactose Pk1 Resp.` - `blank_Galactose Pk1 Resp.` < 0,
+      0,
+      `Galactose Pk1 Resp.` - `blank_Galactose Pk1 Resp.`
+    ),
+    `Galactose Pk2 Resp.` = ifelse(
+      `Galactose Pk2 Resp.` - `blank_Galactose Pk2 Resp.` < 0,
+      0,
+      `Galactose Pk2 Resp.` - `blank_Galactose Pk2 Resp.`
+    ),
+    `Galactitol Resp.` = ifelse(
+      `Galactitol Resp.` - `blank_Galactitol Resp.` < 0,
+      0,
+      `Galactitol Resp.` - `blank_Galactitol Resp.`
+    ),
+    `1,5-Galactonolactone Resp.` = ifelse(
+      `1,5-Galactonolactone Resp.` - `blank_1,5-Galactonolactone Resp.` < 0,
+      0,
+      `1,5-Galactonolactone Resp.` - `blank_1,5-Galactonolactone Resp.`
+    ),
+    `Galactonate Resp.` = ifelse(
+      `Galactonate Resp.` - `blank_Galactonate Resp.` < 0,
+      0,
+      `Galactonate Resp.` - `blank_Galactonate Resp.`
+    ),
+    `Lactose Pk1 Resp.` = ifelse(
+      `Lactose Pk1 Resp.` - `blank_Lactose Pk1 Resp.` < 0,
+      0,
+      `Lactose Pk1 Resp.` - `blank_Lactose Pk1 Resp.`
+    ),
+    `Lactose Pk2 Resp.` = ifelse(
+      `Lactose Pk2 Resp.` - `blank_Lactose Pk2 Resp.` < 0,
+      0,
+      `Lactose Pk2 Resp.` - `blank_Lactose Pk2 Resp.`
+    )
+  ) %>%
+  select(Name.x, Type, batch.x, injection_order, `IStd Xylose Resp.`, `IStd Fructose Resp.`, `1,4-Galactonolactone Resp.`, `Galactose Pk1 Resp.`, `Galactose Pk2 Resp.`, `Galactitol Resp.`, `1,5-Galactonolactone Resp.`, `Galactonate Resp.`, `Lactose Pk1 Resp.`, `Lactose Pk2 Resp.`) %>%
+  rename(
+    Name = Name.x,
+    batch = batch.x
+  )
+
+write.table(
+  blank_corrected,
+  file.path(raw_results_dir, "4_blank_corrected.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r message = FALSE, fig.width = 8, fig.height = 8, fig.align = "center"}
+blank_corrected_drift = blank_corrected %>% 
+  select(all_of(c("Type", "batch", "injection_order", response_colnames))) %>% 
+  pivot_longer(
+    !c("Type", "batch", "injection_order"),
+    names_to = "metabolite",
+    values_to = "intensity"
+  ) %>% 
+  mutate(
+    order = order(injection_order),
+    logint = log(intensity + 1)
+  ) %>% 
+  filter(Type == "QC") %>%
+  ggplot(aes(x = order, y = logint, color = batch)) + 
+    geom_point() + 
+    ggtitle("Peak intensities in QC samples after blank subtraction") +
+    facet_grid(metabolite ~ ., scales = "free_y") + 
+    theme_light()
+
+ggsave(file.path(qc_plots_dir, "blank_corrected_drifts.pdf"), blank_corrected_drift)
+blank_corrected_drift
+```
+
+While we do not see a major difference, some of the variation coming from the blank samples should now have been taken care of.
+
+## Aggregation of metabolite peaks
+
+The next step is to aggregate the metabolite peaks. 
+
+```{r aggregation}
+data_norm_agg = blank_corrected %>%
+  mutate(
+    galactose_ion_area = `Galactose Pk1 Resp.` + `Galactose Pk2 Resp.`,
+    lactose_ion_area = `Lactose Pk1 Resp.` + `Lactose Pk2 Resp.`,
+    galactitol_ion_area = `Galactitol Resp.`,
+    galactonate_ion_area = (`Galactonate Resp.`/8502*95655) + (`1,4-Galactonolactone Resp.`/9999*66940) + (`1,5-Galactonolactone Resp.`/4861*74758)
+  ) %>%
+  select(
+    all_of(
+        c(
+            "Type",
+            "batch",
+            "Name",
+            "injection_order",
+            "galactose_ion_area",
+            "lactose_ion_area",
+            "galactitol_ion_area",
+            "galactonate_ion_area"
+        )
+    )
+  )
+
+write.table(
+  data_norm_agg,
+  file.path(raw_results_dir, "5_peak_aggregated.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r }
+paged_table(data_norm_agg)
+```
+
+We can now plot again to see how the data looks after the aggregation.
+
+```{r aggregation_qc, fig.height = 8, fig.width = 8, fig.align = "center", warning = FALSE, message = FALSE}
+distribution_after_norm_and_agg = data_norm_agg %>%
+  filter(Type == "QC") %>%
+  select(batch, Name, injection_order, Type, colnames(data_norm_agg)[grep("ion_area", colnames(data_norm_agg))]) %>%
+  pivot_longer(!c("Type", "Name", "batch", "injection_order"), names_to = "metabolite", values_to = "intensity") %>%
+  mutate(logint = log(intensity + 1)) %>%
+  ggplot(aes(x = logint, color = batch)) +
+    geom_density() +
+    ggtitle("Distribution of QC intensities after normalization and aggregation") +
+    xlab("log(Intensity)") +
+    ylab("Density") +
+    facet_grid(metabolite ~ Type, scales = "free_y") +
+    theme_light()
+
+drift_after_norm_agg = data_norm_agg %>%
+  filter(Type == "QC") %>%
+  select(batch, Name, injection_order, Type, colnames(data_norm_agg)[grep("ion_area", colnames(data_norm_agg))]) %>%
+  pivot_longer(!c("Type", "Name", "batch", "injection_order"), names_to = "metabolite", values_to = "intensity") %>%
+  mutate(
+    logint = log(intensity + 1),
+    order = order(injection_order, decreasing = FALSE)
+  ) %>%
+  ggplot(aes(x = order, y = logint, color = batch)) +
+    geom_line() +
+    ggtitle("Drift of QC samples after normalization and aggregation") +
+    xlab("Injection order") +
+    ylab("log(Intensity)") +
+    facet_grid(metabolite ~ Type, scales = "free_y") +
+    theme_light()
+
+
+ggsave(file.path(qc_plots_dir, "3_distribution_after_norm_blank_agg.pdf"), distribution_after_norm_and_agg)
+ggsave(file.path(qc_plots_dir, "drift_after_norm_blank_agg.pdf"), drift_after_norm_agg)
+
+distribution_after_norm_and_agg
+drift_after_norm_agg
+```
+
+Things are slowly getting better, but the distributions still look quite different. Also interesting, the aggregation of both lactose peaks seems to bring all lactose batches closer together.
+
+## Quantification using the standard curve for each batch and metabolite
+
+The next step will be to quantify each metabolite's abundance using the standard curves. The main idea here is that the standards contain the intensity measured by the instrument for a known concentration of a metabolite. We can then train a linear model predicting the concentration of a metabolite using the measured intensity. This model will be used to predict the metabolite concentration for each sample.
+
+In theory, as we are quantifying the data by batch, we may be able to remove some of the batch effects we observed in the previous plots. In addition, since we observed a shift in sensitivities in the middle of batches 5 and 11, we will match each sample with its most similar quantification curve.
+
+First, we will create a mapping from each sample to its most representative quantification curve. For this, we will follow a hybrid approach based on the following figure:
+
+- Batches 1-4, 6-10, and 12-14: since these batches seem relatively stable, meaning no strong jumps in intensity, we will use each sample's closest quantification curve.
+- Batches 5 and 11: since this batch shows a clear jump in intensities, we will manually map each sample to the quantification curve that is most similar to it. In batch 5, this will be done by assigning all measurements with a raw Xylose intensity \<= 6e+06 (dashed black line on the plot) to the first quantification curve, and the rest to the second. In batch 11, we will use a threshold of 6.875e+06.
+- Batch 16: as this batch shows a continuous increase in intensities, we will use a threshold of 5.7e+06 to decide each sample's quantification curve.
+- Batch 17: this batch shows two subgroups, so we will split them based on a threshold of 4e+06.
+
+```{r fig.height = 8, fig.width = 8, fig.align = "center"}
+standard_data %>%
+  filter(Type != "Blank") %>%
+  mutate(order = order(injection_order, decreasing = FALSE)) %>%
+  ggplot(aes(x = order, y = `IStd Xylose Resp.`, color = batch, shape = Type)) + 
+    geom_point() +
+    geom_hline(yintercept = 6e+06, linetype = "dashed") +
+    geom_hline(yintercept = 6.875e+06, linetype = "dashed") +
+    xlab("Injection order") +
+    ylab("Intensity") +
+    ggtitle("Internal standard intensity") +
+    theme_light()
+```
+
+```{r sample_to_standard_map}
+# Batches 1-4, 6-10, and 12-15 -> get closest standard
+sample_curve_maps_ls = list()
+batches = c(1:4, 6:10, 12:15)
+i = 1
+for (batch_idx in 1:length(batches)) {
+  
+  datax = data_norm_agg %>%
+    filter(batch == batches[batch_idx])
+  
+  sample_curve_maps_ls[[i]] = get_closest_standard(datax)
+  i = i + 1
+  
+}
+
+# Batch 5 -> done manually based on raw intensity <= 6e+06
+sample_curve_maps_ls[[i]] = data %>%
+  filter(batch == 5) %>%
+  mutate(
+    closest_standard = case_when(
+      `IStd Xylose Resp.` <= 6e+06 ~ 1,
+      `IStd Xylose Resp.` > 6e+06 ~ 2
+    )
+  ) %>%
+  select(batch, Name, closest_standard, injection_order)
+
+i = i + 1
+# Batch 11 -> done manually based on raw intensity <= 6.875e+06
+sample_curve_maps_ls[[i]] = data %>%
+  filter(batch == 11) %>%
+  mutate(
+    closest_standard = case_when(
+      `IStd Xylose Resp.` >= 6.875e+06 ~ 1,
+      `IStd Xylose Resp.` < 6.875e+06 ~ 2
+    )
+  ) %>%
+  select(batch, Name, closest_standard, injection_order)
+
+i = i + 1
+# Batch 16 -> done manually based on raw intensity <= 5.7e+06
+sample_curve_maps_ls[[i]] = data %>%
+  filter(batch == 16) %>%
+  mutate(
+    closest_standard = case_when(
+      `IStd Xylose Resp.` <= 5.75e+06 ~ 1,
+      `IStd Xylose Resp.` > 5.75e+06 ~ 2
+    )
+  ) %>%
+  select(batch, Name, closest_standard, injection_order)
+
+i = i + 1
+# Batch 17 -> done manually based on raw intensity <= 4e+06
+sample_curve_maps_ls[[i]] = data %>%
+  filter(batch == 17) %>%
+  mutate(
+    closest_standard = case_when(
+      `IStd Xylose Resp.` >= 4e+06 ~ 1,
+      `IStd Xylose Resp.` < 4e+06 ~ 2,
+    )
+  ) %>%
+  select(batch, Name, closest_standard, injection_order)
+
+sample_curve_maps = do.call(rbind, sample_curve_maps_ls)
+
+write.table(
+  sample_curve_maps,
+  file.path(raw_results_dir, "6_sample_curve_maps.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+Just to make sure, we will plot again the drift plot with the information of which quantification curve was selected for each sample:
+
+```{r sample_to_curve_plot, message = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+sample_curve_plot = sample_curve_maps %>%
+  arrange(injection_order) %>%
+  mutate(order = order(injection_order)) %>%
+  inner_join(data, by = "injection_order") %>%
+  ggplot(aes(x = order, y = `IStd Xylose Resp.`, color = batch.x, shape = Type, label = closest_standard)) +
+    geom_text() +
+    theme_light()
+
+ggsave(file.path(qc_plots_dir, "sample_to_quant_curve_plot.pdf"), sample_curve_plot)
+sample_curve_plot
+```
+
+While this works for pretty much all samples, we see that the samples falling between the first and second sub-batches of batches 5 and 11 are a bit off. However, these samples are quite out of range from both quantification curves, and will most likely end up being discarded as outliers. For example, there are some samples with intensity values between 0-2.5e+06. Four of these samples were already reprocessed due to low intensities, which suggests that they indeed had lower levels.
+
+```{r }
+data %>% filter(`IStd Xylose Resp.` < 2.5e+06) %>% pull(Name)
+```
+
+In addition, the lab technician mentioned that some measurements in the quantification standards turned a bit low. Let's plot the standard curves again to check this:
+
+```{r standard_curves_check, message = FALSE, warning = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+quant_curves_check = data_norm_agg %>% 
+  filter(Type == "Std") %>% 
+  select(batch, injection_order, colnames(data_norm_agg)[grep("ion_area", colnames(data_norm_agg))]) %>% 
+  mutate(
+    order = order(injection_order, decreasing = FALSE)
+  ) %>% 
+  pivot_longer(!c("batch", "injection_order", "order"), names_to = "metabolite", values_to = "intensity") %>% 
+  ggplot(aes(x = order, y = intensity, color = batch, group = batch)) + 
+    geom_line() + 
+    geom_point() + 
+    facet_grid(metabolite ~ ., scales = "free_y") + 
+    theme_light()
+
+ggsave(file.path(qc_plots_dir, "quantification_curves.pdf"), quant_curves_check)
+quant_curves_check
+```
+
+The expectation on this plot is to observe an "N" shape for each batch, indicating that the measured intensity increased with the increase in concentration of the quantification standard. While some of the compounds show the expected shape, we see that some cases show a dip in the intensity of standard 3. Since each point within a quantification curve should be higher than its previous one (due to increasing concentration), we will remove standard points where the measured intensity is lower than its preceding one.
+
+We also attempted to add some extra measurements on the quantification curve of the last batch to see if this would help quantify samples on the higher concentration ranges. As we see, the higher concentrations do not result in a linear increase in intensities, meaning that the regression model would struggle to properly quantify samples if we used all points. Therefore, we will skip the extra points and use the same amount of data for all batches.
+
+```{r quantification, message = FALSE, warning = FALSE}
+processed_batches_ls = list()
+batches = unique(data_norm_agg$batch)
+
+for (batch_idx in 1:length(batches)) {
+  
+  if (batches[batch_idx] == 16) {
+    datax = data_norm_agg %>%
+      filter(batch == batches[batch_idx]) %>%
+      filter(!grepl("Std_[678]", Name))
+  } else {
+    datax = data_norm_agg %>%
+      filter(batch == batches[batch_idx]) 
+  }
+  
+  batch_standard_curve_map = sample_curve_maps %>%
+    filter(batch == batch_idx)
+
+  datax = datax[order(datax$Type), ] #Std are alphabetically at the end, now known concentrations can be entered
+
+    datax = introduce_known_concentrations(datax, custom_standard_map = batch_standard_curve_map)
+  
+    datax = subract_matrix_blanks(datax, custom_standard_map = batch_standard_curve_map)
+  
+
+  #Calculate sample concentrations
+  datax = calculate_sample_concentrations(datax, custom_standard_map = batch_standard_curve_map, r2_output_file = file.path(raw_results_dir, "r_squared_results.tsv"))
+
+  #Put data "x" back into batch data AND REPEAT
+  processed_batches_ls[[batch_idx]] = datax
+
+}
+
+data_quantified = do.call(rbind, processed_batches_ls) %>%
+  rename(
+    "injection_order" = "injection_order.x",
+    "batch" = "batch.x"
+  )
+
+write.table(
+  data_quantified,
+  file.path(raw_results_dir, "7_quantified_data.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write_xlsx(data_quantified, "urine_targeted_gcms_qcs_processed.xlsx")
+```
+
+Let's check up the distribution and drift for the quantified data using the closest standard.
+
+```{r warning = FALSE, message = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+distribution_after_quantification = data_quantified %>% 
+    filter(Type %in% c("QC", "Sample")) %>%
+    select(Type, batch, injection_order, colnames(data_quantified)[grep("_concentration_ug_per_100ul", colnames(data_quantified))]) %>%
+    pivot_longer(!c("Type", "batch", "injection_order"), names_to = "metabolite", values_to = "value") %>%
+    ggplot(aes(x = value, color = batch)) +
+        geom_density() +
+        ggtitle("Distribution after quantification") +
+        xlab("log(Concentration)") +
+        ylab("Density") +
+        facet_grid(metabolite ~ Type, scales = "free_y") +
+        theme_light()
+
+drift_after_quantification = data_quantified %>% 
+    filter(Type %in% c("QC", "Sample")) %>%
+    mutate(order = order(injection_order, decreasing = FALSE)) %>%
+    select(Type, batch, order, colnames(data_quantified)[grep("_concentration_ug_per_100ul", colnames(data_quantified))]) %>%
+    pivot_longer(!c("Type", "batch", "order"), names_to = "metabolite", values_to = "value") %>%
+    ggplot(aes(x = order, y = value, group = batch, color = batch)) +
+        geom_line() +
+        facet_grid(metabolite ~ Type, scales = "free_y") +
+        theme_light()
+
+ggsave(file.path(qc_plots_dir, "4_distribution_after_quantification.pdf"), distribution_after_quantification)
+ggsave(file.path(qc_plots_dir, "drifts_after_quantification.pdf"), drift_after_quantification)
+
+distribution_after_quantification
+drift_after_quantification
+```
+
+The plots above show the distribution and drift after mapping each sample to the most reasonable standard. Overall, it seems the batch effect have been taken care of. However, it is worth noting that we still see a bit of wiggle in the quantified QC samples for lactose and galactitol. I believe the best way to take care of this is to include the batch number as a covariate in our differential analysis.
+
+```{r fig.height = 8, fig.width = 8, fig.align = "center"}
+data_quantified %>%
+  select(all_of(c("Type", "batch", "injection_order", colnames(data_quantified)[grepl("concentration", colnames(data_quantified))]))) %>%
+  arrange(injection_order) %>%
+  mutate(order = order(injection_order)) %>%
+  pivot_longer(!c("Type", "batch", "injection_order", "order"), names_to = "metabolite", values_to = "concentration") %>%
+  ggplot(aes(x = order, y = concentration, color = batch, shape = Type)) +
+    geom_point() +
+    facet_grid(metabolite ~ Type, scales = "free_y") +
+    theme_light()
+```
+
+Also just as a check, let's see how many measured intensities are outside the range of intensities measured in the standards.
+
+```{r warning = FALSE}
+standard_ranges = data_quantified %>%
+    arrange(injection_order, decreasing = FALSE) %>%
+    filter(grepl("Std", Name)) %>%
+    # mutate(standard_group = rep(1:7, each = 12)) %>%
+    group_by(batch) %>%
+    summarise(
+        min_galactose = min(galactose_ion_area),
+        max_galactose = max(galactose_ion_area),
+        min_lactose = min(lactose_ion_area),
+        max_lactose = max(lactose_ion_area),
+        min_galactitol = min(galactitol_ion_area),
+        max_galactitol = max(galactitol_ion_area),
+        min_galactonate = min(galactonate_ion_area),
+        max_galactonate = max(galactonate_ion_area)
+    ) %>%
+    pivot_longer(!batch, names_to = "metabolite", values_to = "value") %>%
+    separate(metabolite, c("measure", "metabolite"))
+
+midpoints = data_quantified %>% 
+    filter(grepl("Std", Name)) %>% 
+    arrange(injection_order, decreasing = FALSE) %>% 
+    select(injection_order) %>%
+    mutate(
+        standard_group = rep(1:17, each = 12)
+    ) %>%
+    group_by(standard_group) %>% 
+    summarise(midpoint = mean(injection_order))
+
+standard_midpoints = data_quantified %>% 
+    filter(grepl("Std", Name)) %>% 
+    arrange(injection_order, decreasing = FALSE) %>% 
+    select(injection_order) %>%
+    mutate(
+        standard_group = rep(1:17, each = 12)
+    ) %>%
+    inner_join(midpoints, by = "standard_group")
+    
+df_for_checking = data_quantified %>% 
+    left_join(standard_midpoints, by = "injection_order")
+
+df_for_checking$closest_standard = sapply(1:nrow(df_for_checking), function(x) {
+    which.min(abs(df_for_checking$injection_order[x] - unique(standard_midpoints$midpoint)))
+})
+
+ranges_ls = list()
+for (group in standard_ranges$batch) {
+  
+    current_range = standard_ranges %>%
+        filter(batch == group)
+  
+    ranges_ls[[group]] = df_for_checking %>%
+        filter(!grepl("Std", Name)) %>%
+        filter(closest_standard == group) %>%
+        select(Name, closest_standard, injection_order, galactose_ion_area, lactose_ion_area, galactitol_ion_area, galactonate_ion_area) %>%
+        pivot_longer(!c(Name, injection_order, closest_standard), names_to = "metabolite", values_to = "value") %>%
+        mutate(metabolite = gsub("_ion_area", "", metabolite)) %>%
+        inner_join(current_range, by = "metabolite") %>%
+        mutate(
+            in_range = case_when(
+                measure == "min" ~ value.x >= value.y,
+                measure == "max" ~ value.x <= value.y
+            )
+        )
+    
+}
+
+check_df = do.call(rbind, ranges_ls)
+```
+
+```{r fig.height = 8, fig.width = 8, fig.align = "center"}
+check_df %>%
+    select(in_range) %>%
+    group_by(in_range) %>%
+    summarise(Count = n()) %>%
+    ggplot(aes(x = in_range, y = Count)) +
+        geom_bar(stat = "identity") +
+        ggtitle("Number of values within standard range") +
+        xlab("In range") +
+        theme_light()
+```
+
+Some values are outside the standard ranges. We should keep that in mind in the interpretation.
+
+Finally, we will also plot the distribution of R^2^ :
+
+```{r r2_plot, message = FALSE, fig.align = "center"}
+r2s = read.delim(file.path(raw_results_dir, "r_squared_results.tsv"))
+r2_plot = ggplot(r2s, aes(y = r2)) +
+  geom_boxplot() +
+  theme_light()
+
+ggsave(file.path(qc_plots_dir, "r_squared_distribution.pdf"), r2_plot)
+r2_plot
+
+print(paste0("Mean: ", mean(r2s$r2)))
+print(paste0("SD: ", sd(r2s$r2)))
+print(paste0("Median: ", median(r2s$r2)))
+print(paste0("Max: ", max(r2s$r2)))
+print(paste0("Min: ", min(r2s$r2)))
+```
+
+## Normalization using urine volume
+
+```{r outlier_filtering_1}
+## Preparation
+data_quantified = data_quantified %>%
+    mutate(
+        # Extract leading digits (can be 1–3 digits or more)
+        extracted_digits = str_extract(Name, "^[0-9]+"), #Look for digits at the beginning of the string
+        # Create study_id with padded digits to always have 3 digits
+        study_id = if_else(
+            !is.na(extracted_digits),
+            paste0("LB", str_pad(extracted_digits, width = 3, pad = "0")),
+            NA_character_
+        )
+    ) %>%
+    left_join(unblinding, by = join_by("study_id" == "study_id_lb"))
+
+# Get REDCap data
+redcap_data = read.csv("UrineGCMSAnalysisMetadata_20260430.csv") %>%
+  mutate(study_id = gsub("_", "", study_id_lb)) #In this specific extract, first row included explanations for collaborators
+
+# Join with quantified GC-MS data
+data_quantified = data_quantified %>%
+    left_join(redcap_data, by = "study_id")
+```
+
+Next we will normalize the data by using the urine volume.
+
+```{r urine_norm, warning = FALSE, message = FALSE}
+# Calculate of whole urine volumes under assumption that urine density: 1.020 g/ml
+data_quantified = data_quantified %>%
+    mutate(
+        urine_b2_ml = (int_wt_urine_b2 - int_wt_empty_urine_b2) / 1.02,
+        urine_p1_ml = (int_urine_3_00_wt_pool1 - int_urine_wt_empty_pool1) / 1.02,
+        urine_p2_ml = (int_urine_6_00_wt_pool2 - int_urine_wt_empty_pool2) / 1.02
+    )
+
+# Calculate fluid consumption (water density ~1.00 g/ml)
+data_quantified = data_quantified %>%
+  mutate(
+    water_consumed_b2_ml = 650,
+    water_consumed_p1_ml = int_water_wt_full - int_water_wt_3_00,
+    water_consumed_p2_ml = int_water_wt_full - int_water_wt_6_00
+  )
+
+# Check that urine and water consumption columns survived normalization; re-attach if dropped
+urine_water_cols <- c("urine_b2_ml", "urine_p1_ml", "urine_p2_ml",
+                       "water_consumed_b2_ml", "water_consumed_p1_ml", "water_consumed_p2_ml")
+
+if (!all(urine_water_cols %in% names(data_quantified))) {
+  cat("Some urine/water columns were dropped by normalize_by_urine_volume() - re-attaching.\n")
+  data_normalized = data_normalized %>%
+    left_join(
+      data_quantified %>% dplyr::select(study_id, all_of(urine_water_cols)),
+      by = "study_id"
+    )
+}
+
+# Normalization with whole urine volume
+# (ug/100ul)*ml = 10 ug 
+data_normalized = normalize_by_urine_volume(data_quantified) %>%
+  rename(treatment = int_group)
+
+write.table(
+  data_normalized,
+  file.path(raw_results_dir, "urine_normalized.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write_xlsx(data_normalized, "urine_targeted_gcms_data_processed.xlsx")
+```
+
+```{r }
+paged_table(data_normalized)
+```
+
+```{r message = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+drift_after_urine_norm = data_normalized %>%
+  select(batch, Type, Name, injection_order, galactose_ug, galactitol_ug, galactonate_ug, lactose_ug) %>%
+  filter(!grepl("_AH", Name)) %>%
+  filter(!Type %in% c("QC", "Std")) %>%
+  pivot_longer(!c("Name", "batch", "Type", "injection_order"), names_to = "metabolite", values_to = "ug") %>%
+  mutate(
+     order = order(injection_order, decreasing = FALSE)
+  ) %>%
+  ggplot(aes(x = order, y = ug, color = batch)) +
+  geom_line() +
+  xlab("Injection order") +
+  ylab("ug") +
+  ggtitle("Metabolite amounts after urine normalization") +
+  facet_grid(metabolite ~ ., scales = "free_y") +
+  theme_light()
+
+ggsave(file.path(qc_plots_dir, "drift_after_urine_norm.pdf"), drift_after_urine_norm)
+drift_after_urine_norm
+```
+
+```{r urine_norm_qc, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 8, fig.align = "center"}
+distribution_after_urine_normalization = data_normalized %>% 
+  filter(Type == "Sample") %>%
+  filter(!grepl("_AH", Name)) %>%
+    select(batch, Name, injection_order, galactose_ug, lactose_ug, galactitol_ug, galactonate_ug) %>%
+    pivot_longer(!c(batch, Name, injection_order), names_to = "metabolite", values_to = "ug") %>%
+    ggplot(aes(x = ug, color = batch)) +
+      geom_density() +
+      ggtitle("Metabolite amounts after urine normalization") +
+      facet_grid(metabolite ~ ., scales = "free_y") +
+      theme_light()
+
+boxplot_after_urine_normalization = data_normalized %>% 
+  filter(Type == "Sample") %>%
+  filter(Type == "Sample") %>%
+  select(batch, Name, injection_order, galactose_ug, lactose_ug, galactitol_ug, galactonate_ug) %>%
+  pivot_longer(!c(batch, Name, injection_order), names_to = "metabolite", values_to = "ug") %>%
+  ggplot(aes(x = batch, y = ug, fill = batch)) +
+      geom_boxplot() +
+      facet_grid(metabolite ~ ., scales = "free_y") +
+      theme_light()
+
+ggsave(file.path(qc_plots_dir, "5_distribution_after_urine_normalization.pdf"), distribution_after_urine_normalization)
+ggsave(file.path(qc_plots_dir, "compound_distribution_per_batch.pdf"), boxplot_after_urine_normalization)
+
+distribution_after_urine_normalization
+boxplot_after_urine_normalization
+```
+
+```{r outliers_2}
+samples = data_normalized %>%
+  filter(!is.na(screen_group)) %>%
+  filter(!grepl("_AH", Name)) %>%
+  mutate(
+    timepoint = factor(
+      case_when(
+        grepl("_BL", Name) ~ "Baseline",
+        grepl("_0-3", Name) ~ "0-3h",
+        grepl("_3-6", Name) ~ "3-6h"),
+      levels = c("Baseline", "0-3h", "3-6h")
+    ),
+    screen_group = factor(
+      case_when(
+        screen_group == 1 ~ "Control",
+        screen_group == 2 ~ "LM-A",
+        screen_group == 3 ~ "LM-S"
+      ),
+      levels = c("Control", "LM-A", "LM-S")
+    ),
+    treatment = factor(
+      case_when(
+        treatment == "Treatment A" ~ "Lactose",
+        treatment == "Treatment B" ~ "Glucose"
+      ),
+      levels = c("Lactose", "Glucose")
+    )
+  )
+```
+
+## Exploratory data analysis
+
+Now that we have quantified and normalized the data, let's explore it to see if there are any clear patterns or sources of variation that need to be accounted for.
+
+### PCA {.tabset}
+
+Below is a PCA of the urine-normalized data. From these plots, we can get the following conclusions:
+
+- There do not seem to be any strong batch effects, since samples do not cluster by batch.
+- Time points account for most of the variability in the data.
+- Baseline samples are more similar to samples treated with glucose at any time point.
+- Samples treated with lactose at 0-3 hours (p1) and 3-6 hours (p2) separate by a participant being lactase deficient or not.
+
+```{r analysis_pca, warning = FALSE, message = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+# Group and correct compounds of interest
+vars = c("galactose_ug", "lactose_ug", "galactitol_ug", "galactonate_ug")
+
+# PCA
+pca_df = samples %>%
+    select(Name, all_of(vars)) %>%
+    # unite("id", study_id:timepoint, remove = FALSE) %>%
+    # select(Name, all_of(vars)) %>%
+    tibble::column_to_rownames(var = "Name")
+
+x = prcomp(pca_df, center = TRUE, scale. = TRUE)
+plot_df = as.data.frame(x$x)
+plot_df$study_id = sapply(rownames(plot_df), function(x) {
+  id = strsplit(x, "_")[[1]][1]
+  paste0("LB", id)
+})
+plot_df$timepoint = sapply(rownames(plot_df), function(x) {
+  samples %>%
+    filter(Name == x) %>%
+    pull(timepoint)
+})
+  
+plot_df$study_group = sapply(rownames(plot_df), function(x) {
+  samples %>%
+    filter(Name == x) %>%
+    pull(screen_group)
+})
+
+plot_df$batch = sapply(rownames(plot_df), function(x) {
+  samples %>% 
+    filter(Name == x) %>%
+    pull(batch)
+})
+  
+plot_df$intervention = sapply(rownames(plot_df), function(x) {
+  samples %>% 
+    filter(Name == x) %>%
+    pull(treatment)
+})
+
+plot_df$genotype = sapply(rownames(plot_df), function(x) {
+  mapping %>% 
+    filter(Name == x) %>%
+    pull(gen_test_rs4988235)
+})
+  
+plot_df$study_group = factor(plot_df$study_group)
+plot_df$batch = factor(plot_df$batch)
+plot_df$intervention = factor(plot_df$intervention)
+plot_df$timepoint = factor(plot_df$timepoint, levels = c("Baseline", "0-3h", "3-6h"))
+plot_df$genotype = factor(plot_df$genotype, levels = c("TT", "CT", "CC"))
+
+p1 = ggplot(plot_df, aes(x = PC1, y = PC2, color = study_group)) + 
+    geom_point() + 
+    theme_light()
+# ggsave(file.path(output_dir, "analysis_pca_color_study_group.pdf"), p1)
+p2 = ggplot(plot_df, aes(x = PC1, y = PC2, color = batch)) + 
+    geom_point() + 
+    theme_light()
+# ggsave(file.path(output_dir, "analysis_pca_color_batch.pdf"), p2)
+p3 = ggplot(plot_df, aes(x = PC1, y = PC2, color = study_group)) + 
+    geom_point() + 
+    facet_grid(intervention ~ timepoint) + 
+    guides(
+      color = guide_legend(title = "Screen group")
+    ) +
+    scale_color_manual(
+      values = c(
+        "Control" = "#619CFF",
+        "LM-A" = "#00BA38",
+        "LM-S" = "#F8766D"
+      )
+    ) +
+    theme_light()
+
+p4 = ggplot(plot_df %>% filter(!is.na(genotype)), aes(x = PC1, y = PC2, color = genotype)) + 
+    geom_point() + 
+    facet_grid(intervention ~ timepoint) + 
+    guides(
+      color = guide_legend(title = "Genotype")
+    ) +
+    scale_color_manual(
+      values = c(
+        "TT" = "#619CFF",
+        "CT" = "#00BA38",
+        "CC" = "#F8766D"
+      )
+    ) +
+    theme_light()
+# ggsave(file.path(output_dir, "analysis_pca_color_intervention.pdf"), p3)
+```
+
+#### PCA colored by batch
+
+```{r message = FALSE, fig.align = "center"}
+ggsave(file.path(eda_plots_dir, "PCA_by_batch.pdf"), p2)
+p2
+```
+
+#### PCA colored by screen group, faceted by time point and treatment
+
+```{r message = FALSE, fig.align = "center"}
+ggsave(file.path(eda_plots_dir, "PCA_by_screen_group_and_time.pdf"), p3)
+p3
+```
+
+#### PCA colored by genotype, faceted by time point and treatment
+
+```{r message = FALSE, fig.align = "center"}
+ggsave(file.path(eda_plots_dir, "PCA_by_genotype_and_time.pdf"), p4)
+p4
+```
+
+### Sample-sample correlation heatmap
+
+Just as a different visualization, we will plot a heatmap with all sample-sample pairwise correlations.
+
+```{r cor_mat_heatmap, message = FALSE, warning = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+# Sample-sample correlation
+heatmaps_df = pca_df 
+    # filter(!rownames(pca_df) %in% outliers)
+cor_mat = cor(t(heatmaps_df))
+
+annots_groups = sapply(rownames(cor_mat), function(x) {
+  samples %>% 
+    filter(Name == x) %>%
+    pull(screen_group)
+    # unique(samples$screen_group[samples$study_id == id])
+})
+annots_times = sapply(rownames(cor_mat), function(x) {
+    samples %>% 
+      filter(Name == x) %>%
+      pull(timepoint)
+})
+annots_intervention = sapply(rownames(cor_mat), function(x) {
+    # id = strsplit(x, "_")[[1]][1]
+    # unique(samples$treatment[samples$study_id == id])
+  samples %>% 
+    filter(Name == x) %>%
+    pull(treatment)
+})
+annots_batch = sapply(rownames(cor_mat), function(x) {
+    # id = strsplit(x, "_")[[1]][1]
+    # unique(samples$batch[samples$study_id == id])
+  samples %>% 
+    filter(Name == x) %>%
+    pull(batch)
+})
+
+annots_genotype = sapply(rownames(cor_mat), function(x) {
+  mapping %>%
+    filter(Name == x) %>%
+    pull(gen_test_rs4988235)
+})
+
+
+ha = HeatmapAnnotation(
+    Timepoint = as.factor(annots_times),
+    Group = as.factor(annots_groups),
+    Intervention = as.factor(annots_intervention),
+    Batch = as.factor(annots_batch),
+    Genotype = as.factor(annots_genotype),
+    col = list(
+        Timepoint = c(
+            "Baseline" = "#E41A1CFF",
+            "0-3h" = "#377EB8FF",
+            "3-6h" = "#4DAF4AFF"
+        ),
+        Group = c(
+            "Control" = "#377EB8FF",
+            "LM-A" = "#4DAF4AFF",
+            "LM-S" = "#E41A1CFF"
+        ),
+        Intervention = c(
+            "Lactose" = "#E41A1CFF",
+            "Glucose" = "#377EB8FF"
+        ),
+        Genotype = c(
+          "TT" = "#377EB8FF",
+          "CT" = "#4DAF4AFF",
+          "CC" = "#E41A1CFF"
+        )
+    )
+)
+
+h = Heatmap(
+    cor_mat,
+    top_annotation = ha,
+    show_column_names = FALSE,
+    show_row_names = FALSE,
+    heatmap_legend_param = list(title = "Correlation")
+)
+
+draw(h)
+
+# pdf(file.path(output_dir, "correlation_heatmap.pdf"))
+# draw(h)
+# dev.off()
+```
+
+We can see that samples separate very well by timepoint. In addition, we do not see samples clustering by batch (which is good), and groups 2 and 3 tend to be more correlated in the postprandrial timepoints. Finally, treatment B samples in the postprandrial timepoints also group together.
+
+### Boxplots {.tabset}
+
+```{r analysis_prep}
+# Pivot compounds to rows
+samples_cr = samples %>%
+  select(study_id, screen_group, sex, timepoint, treatment, all_of(vars)) %>%
+  pivot_longer(cols = all_of(vars), names_to = "compound", values_to = "value")
+
+write.table(
+  samples_cr,
+  file.path(raw_results_dir, "samples_cr.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+#### Average dynamics
+
+Below is a plot showing the average values per screening group across time:
+
+```{r avg_dynamics, message = FALSE, warning = FALSE, fig.align = "center"}
+# Plot avg per group
+average_dynamics = samples_cr %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  group_by(compound, screen_group, treatment, timepoint) %>%
+  summarise(avg = mean(value), n = n(), std_err = sd(value) / n()) %>%
+  ggplot(aes(x = timepoint, y = avg, color = screen_group, linetype = treatment, group = interaction(screen_group, treatment))) +
+    geom_line() +
+    geom_point() +
+    geom_ribbon(aes(ymin = avg - std_err, ymax = avg + std_err, fill = screen_group, color = NULL), alpha = 0.4) +
+    ggtitle("Average metabolite amount per group and treatment") +
+    xlab("Time point") +
+    ylab("Average amount") +
+    facet_grid(compound ~ ., scales = "free_y") +
+    guides(
+      color = guide_legend(title = "Screen group"),
+      linetype = guide_legend(title = "Treatment")
+    ) +
+    scale_color_manual(
+      values = c(
+        "Control" = "#619CFF",
+        "LM-A" = "#00BA38",
+        "LM-S" = "#F8766D"
+      )
+    ) +
+  scale_fill_manual(
+    values = c(
+      "Control" = "#619CFF",
+      "LM-A" = "#00BA38",
+      "LM-S" = "#F8766D"
+    )
+  ) +
+    theme_light()
+
+ggsave(file.path(eda_plots_dir, "average_dynamics.pdf"), average_dynamics)
+```
+
+We see a clear difference in the trends, suggesting we should find significant differences when running the differential analysis.
+
+#### Timewise comparison by treatment {.tabset}
+
+##### By screen group
+
+The plot below shows the distribution of metabolite values for each group across all time points, separated by treatment. All metabolites seem to show the expected trends in participants that were given lactose.
+
+```{r within_group_timewise_comparison_plot, message = FALSE, warning = FALSE, fig.align = "center"}
+# Plot boxplots
+within_group_timewise_plot = samples_cr %>%
+  filter(!is.na(treatment)) %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  ggplot(aes(x = screen_group, y = value, fill = timepoint, group = interaction(timepoint, screen_group))) +
+    geom_boxplot() +
+    ggtitle("Distribution of metabolite values per study group, timepoint, and treatment") +
+    facet_grid(compound ~ treatment, scales = "free_y") +
+    xlab("") +
+    ylab("Amount in ug") +
+    theme_light() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(eda_plots_dir, "within_group_timewise_plot.pdf"), within_group_timewise_plot)
+within_group_timewise_plot
+```
+
+##### By genotype
+
+The plot below shows the distribution of metabolite values for each genotype across all time points, separated by treatment. All metabolites seem to show the expected trends in participants that were given lactose.
+
+```{r message = FALSE, warning = FALSE, fig.align = "center"}
+# Plot boxplots 
+within_genotype_timewise_plot = samples_cr %>% 
+  inner_join(mapping %>% select(study_id_lb, gen_test_rs4988235), by = join_by("study_id" == "study_id_lb")) %>%
+  filter(!is.na(treatment)) %>% 
+  filter(!is.na(gen_test_rs4988235)) %>%
+  mutate(gen_test_rs4988235 = factor(gen_test_rs4988235)) %>% 
+  ggplot(aes(
+    x = gen_test_rs4988235,
+    y = value,
+    fill = timepoint,
+    # group = interaction(timepoint, gen_test_rs4988235))
+  )) + 
+    geom_boxplot() + 
+    ggtitle("Distribution of metabolite values per genotype, timepoint, and treatment") +
+    facet_grid(compound ~ treatment, scales = "free_y") + 
+    xlab("") +
+    ylab("Amount in ug") +
+    theme_light() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(file.path(eda_plots_dir, "within_genotype_timewise_plot.pdf"), within_genotype_timewise_plot)
+within_genotype_timewise_plot
+```
+
+#### Group-wise comparison by treatment {.tabset}
+
+##### By screen group
+
+Within each time point, different groups do not seem to be very different, suggesting it is more valuable to analyse the changes of a metabolite in time.
+
+```{r message = FALSE, fig.align = "center"}
+within_time_groupwise_plot = samples_cr %>%
+  filter(!is.na(treatment)) %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  ggplot(aes(x = timepoint, y = value, fill = screen_group, group = interaction(timepoint, screen_group))) +
+    geom_boxplot() +
+    ggtitle("Distribution of metabolite values per study group, timepoint, and treatment") +
+    xlab("") +
+    ylab("Amount in ug") +
+    facet_grid(compound ~ treatment, scales = "free_y") +
+    guides(
+      fill = guide_legend(title = "Screen group")
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Control" = "#619CFF",
+        "LM-A" = "#00BA38",
+        "LM-S" = "#F8766D"
+      )
+    ) +
+    theme_light()
+
+ggsave(file.path(eda_plots_dir, "within_time_groupwise_plot.pdf"), within_time_groupwise_plot)
+within_time_groupwise_plot
+```
+
+##### By genotype
+
+```{r warning = FALSE, message = FALSE, fig.align = "center"}
+within_time_genotypewise_plot = samples_cr %>%
+  filter(!is.na(treatment)) %>% 
+  inner_join(mapping %>% select(study_id_lb, gen_test_rs4988235), by = join_by("study_id" == "study_id_lb")) %>%
+  filter(!is.na(gen_test_rs4988235)) %>%
+  mutate(gen_test_rs4988235 = factor(gen_test_rs4988235)) %>%
+  ggplot(aes(x = timepoint, y = value, fill = gen_test_rs4988235)) +
+  geom_boxplot() +
+  ggtitle("Distribution of metabolite values per genotype, timepoint, and treatment") +
+  xlab("") +
+  ylab("Amount in ug") +
+  facet_grid(compound ~ treatment, scales = "free_y") +
+  guides(
+    fill = guide_legend(title = "Genotype")
+  ) +
+  scale_fill_manual(
+    values = c(
+      "TT" = "#619CFF",
+      "CT" = "#00BA38",
+      "CC" = "#F8766D"
+    )
+  ) +
+  theme_light()
+
+ggsave(file.path(eda_plots_dir, "within_time_genotypewise_plot.pdf"), within_time_genotypewise_plot)
+within_time_genotypewise_plot
+```
+
+#### Difference from the baseline {.tabset}
+
+##### By screen group
+
+We can also look at how samples distribute when computing the difference from the baseline.
+
+```{r diff_preparation}
+# Pivot timepoints to columns 
+samples_tc = samples_cr %>%
+  pivot_wider(
+    id_cols = c(study_id, screen_group, sex, compound, treatment), # set these columns as identifiers
+    names_from = timepoint, # Pivot these to columns
+    values_from = value, # Values go into new columns
+  )
+
+# Calculate the differences between p1 and p2 from baseline
+samples_diff = samples_tc %>%
+  mutate(
+    diff_p1 = `0-3h` - Baseline,
+    diff_p2 = `3-6h` - Baseline
+  ) %>%
+  select(study_id, screen_group, compound, treatment, diff_p1, diff_p2) %>%
+  pivot_longer(
+    cols = starts_with("diff_"),
+    names_to = "timepoint",
+    names_prefix = "diff_",
+    values_to = "diff_to_bl"
+  ) %>%
+  mutate(
+    timepoint = factor(
+      case_when(
+        timepoint == "p1" ~ "0-3h",
+        timepoint == "p2" ~ "3-6h"
+      ),
+      levels = c("0-3h", "3-6h")
+    )
+  )
+```
+
+The boxplot below shows the differences from the baseline. We see how here we can better separate the groups.
+
+```{r diff_from_bl, message = FALSE, warning = FALSE, fig.align = "center"}
+# Plot average difference from baseline
+diff_from_baseline_by_group = samples_diff %>%
+  filter(!is.na(treatment)) %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  ggplot(aes(x = timepoint, y = diff_to_bl, fill = screen_group, group = interaction(timepoint, screen_group, treatment))) +
+    geom_boxplot() +
+    xlab("") +
+    ylab("Difference from baseline") +
+    facet_grid(compound ~ treatment, scales = "free_y") +
+    guides(
+      fill = guide_legend(title = "Screen group")
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Control" = "#619CFF",
+        "LM-A" = "#00BA38",
+        "LM-S" = "#F8766D"
+      )
+    ) +
+    theme_light()
+
+ggsave(file.path(eda_plots_dir, "diff_from_baseline_by_group.pdf"), diff_from_baseline_by_group)
+diff_from_baseline_by_group
+```
+
+##### By genotype
+
+```{r message = FALSE, warning = FALSE, fig.align = "center"}
+diff_from_baseline_by_genotype = samples_diff %>%
+  filter(!is.na(treatment)) %>%
+  inner_join(mapping %>% select(study_id_lb, gen_test_rs4988235), by = join_by("study_id" == "study_id_lb")) %>%
+  filter(!is.na(gen_test_rs4988235)) %>%
+  mutate(gen_test_rs4988235 = factor(gen_test_rs4988235)) %>%
+  ggplot(aes(x = timepoint, y = diff_to_bl, fill = gen_test_rs4988235)) +
+  geom_boxplot() +
+  xlab("") +
+  ylab("Difference from baseline") +
+  facet_grid(compound ~ treatment, scales = "free_y") +
+  guides(
+    fill = guide_legend(title = "Genotype")
+  ) +
+  scale_fill_manual(
+    values = c(
+      "TT" = "#619CFF",
+      "CT" = "#00BA38",
+      "CC" = "#F8766D"
+    )
+  ) +
+  theme_light()
+
+ggsave(file.path(eda_plots_dir, "diff_from_baseline_by_genotype.pdf"), diff_from_baseline_by_genotype)
+diff_from_baseline_by_genotype
+```
+
+## Differential analysis {.tabset}
+
+### By screen group
+
+#### Comparison of groups within each time point
+
+We start by comparing the screening groups at each time point. As we saw in the exploration, we do not expect to find a lot of differences here.
+
+```{r diff_analysis_within_timepoint}
+# Test for significant differences between groups and timepoints
+## Rank-based ANCOVA
+# Compare groups within a timepoint
+results = samples_cr %>%
+    filter(!is.na(treatment)) %>%
+      mutate(sex = factor(sex)) %>%
+    group_by(compound, timepoint, treatment) %>%
+    summarise(p_value = {df_sub <- cur_data() %>% mutate(rank_value = rank(value))
+            fit <- lm(rank_value ~ screen_group + sex, data = df_sub)
+            anova(fit)["screen_group", "Pr(>F)"]},
+        .groups = "drop"
+    ) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+    arrange(p_value)
+
+write.table(
+  results,
+  file.path(dea_dir, "within_timepoint_by_group.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r }
+paged_table(results %>% filter(p_adj <= 0.05))
+```
+
+We observe significant differences for lactose, galactonate, and galactitol at p2 in treatment A, as well as an almost significant difference for lactose, galactitol, and galactose at p1 in treatment A. This justifies running a post-hoc test to see which between-group differences might be causing these differences.
+
+```{r, message = FALSE, warning = FALSE}
+library(emmeans)
+
+sig_res <- results %>% filter(p_adj <= 0.05)
+
+samples_cr_posthoc <- samples_cr %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  filter(!is.na(treatment)) %>%
+  semi_join(sig_res, by = c("compound", "timepoint", "treatment"))
+
+post_hoc_results <- samples_cr_posthoc %>%
+  group_by(compound, timepoint, treatment) %>%
+  group_modify(~ {
+    df_sub <- .x %>% mutate(rank_value = rank(value))
+
+    fit <- lm(rank_value ~ screen_group + sex, data = df_sub)
+
+    emm <- emmeans(fit, pairwise ~ screen_group)
+
+    # raw pairwise p-values from the covariate-adjusted contrasts
+    summary(emm$contrasts, adjust = "none") %>%
+      as_tibble() %>%
+      transmute(
+        comparison = contrast,
+        estimate,
+        SE,
+        df,
+        t.ratio,
+        p_value = p.value
+      ) %>%
+      mutate(p_adj = p.adjust(p_value, method = "BH"))
+  }) %>%
+  ungroup() %>%
+  arrange(p_adj) %>%
+  add_significance(p.col = "p_adj")
+
+write.table(
+  post_hoc_results,
+  file.path(dea_dir, "within_timepoint_by_group_posthoc.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+paged_table(post_hoc_results %>% arrange(p_adj) %>% filter(p_adj <= 0.05))
+```
+
+We run the post-hoc test on the comparisons that came out significant in the Kruskal-Wallis test. The results show that groups 2 and 3 show significant differences with respect to group 1 in the amount of lactose at 3-6 hours. In addition, groups 2 and 3 are also different from each other. This is not super exciting, but good to see as it is directly explained by the lower lactase activity.
+
+```{r, message = FALSE, fig.align = "center", fig.height = 8}
+post_hoc_results <- post_hoc_results %>%
+  mutate(comparison = gsub("[()]", "", comparison))
+
+comparisons_ls = build_posthoc_plot(samples_cr, post_hoc_results, sig_thr = 0.05, test = "timewise")
+comparisons_df = do.call(rbind, comparisons_ls)
+
+posthoc_timewise_by_group = samples_cr %>%
+  filter(!is.na(treatment)) %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  ggplot(aes(x = timepoint, y = value, fill = screen_group, group = interaction(timepoint, screen_group))) +
+    geom_boxplot() +
+    geom_segment(data = comparisons_df, aes(x = xstart, xend = xend, y = yval, fill = NULL, group = NULL)) + 
+    geom_text(data = comparisons_df, aes(x = xlabel, y = ylabel, fill = NULL, group = NULL, label = p_adj.signif)) +
+    ggtitle("Distribution of metabolite values per study group, timepoint, and treatment") +
+    xlab("Timepoint") +
+    ylab("Amount in ug") +
+    facet_grid(compound ~ treatment, scales = "free_y") +
+    guides(
+      fill = guide_legend(title = "Screen group")
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Control" = "#619CFF",
+        "LM-A" = "#00BA38",
+        "LM-S" = "#F8766D"
+      )
+    ) +
+    theme_light() +
+    theme(legend.position = "bottom")
+
+ggsave(file.path(dea_dir, "posthoc_timewise_by_group.pdf"), posthoc_timewise_by_group)
+posthoc_timewise_by_group
+```
+
+```{r, fig.align = "center", fig.height = 8}
+
+library(patchwork)
+#source("urine_metabolome_utils.R")
+
+# ── Build post-hoc comparisons ─────────────────────────────────────────────────
+comparisons_ls <- build_posthoc_plot(samples_cr, post_hoc_results, sig_thr = 0.05, test = "timewise")
+comparisons_df <- do.call(rbind, comparisons_ls)
+
+# ── Setup for plot ──────────────────────────────────────────────────────────────────────
+
+compound_order <- c("lactose_ug", "galactose_ug", "galactonate_ug", "galactitol_ug")
+compound_labels <- c("lactose_ug"     = "Lactose",
+                     "galactose_ug"   = "Galactose",
+                     "galactonate_ug" = "Galactonate",
+                     "galactitol_ug"  = "Galactitol")
+
+samples_lac <- samples_cr %>% #Filter for lactose
+  filter(!is.na(treatment), treatment == "Lactose") %>%
+  mutate( screen_group = factor(screen_group,
+                          levels = c("Control", "LM-A", "LM-S"),
+                          labels = c("Controls", "LMs", "LIs")),
+    compound     = factor(compound, levels = compound_order))
+
+comparisons_lac <- comparisons_df %>%
+  filter(treatment == "Lactose") %>%
+  mutate(compound = factor(compound, levels = compound_order))
+
+samples_lac_summary <- samples_lac %>%
+  group_by(compound, timepoint, screen_group) %>%
+  summarise(mean = mean(value, na.rm = TRUE),
+          median = median(value, na.rm = TRUE),
+    q25    = quantile(value, 0.25, na.rm = TRUE),
+    q75    = quantile(value, 0.75, na.rm = TRUE),
+     se     = sd(value, na.rm = TRUE)/sqrt(n()),
+    .groups = "drop") %>%
+  mutate(compound = factor(compound, levels = compound_order))
+
+# ── Extract y-axis limits from lactose data ────────────────────────────────────
+
+# Line plot limits (based on means ± SE)
+y_limits_line <- samples_cr %>%
+  filter(!is.na(treatment), treatment == "Lactose") %>%
+  group_by(compound, timepoint, screen_group) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    se   = sd(value, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop") %>%
+  mutate(upper = mean + se) %>%          
+  group_by(compound) %>%
+  summarise(
+    ymax = max(upper, na.rm = TRUE) * 1.1,
+    ymin = 0,
+    .groups = "drop")
+
+# Box plot limits (based on raw values)
+y_limits_box <- samples_cr %>%
+  filter(!is.na(treatment), treatment == "Lactose") %>%
+  group_by(compound) %>%
+  summarise(ymax = max(value, na.rm = TRUE) * 1.1,
+            ymin = 0,
+            .groups = "drop")
+
+# Convert to named lists
+y_limits_line_list <- setNames(
+  mapply(c, y_limits_line$ymin, y_limits_line$ymax, SIMPLIFY = FALSE),
+  y_limits_line$compound)
+
+y_limits_box_list <- setNames(
+  mapply(c, y_limits_box$ymin, y_limits_box$ymax, SIMPLIFY = FALSE),
+  y_limits_box$compound)
+
+# ── Helper (defined once) ──────────────────────────────────────────────────────
+
+make_compound_plots <- function(compound_name, show_legend = FALSE) {
+  
+  ylims_l <- y_limits_line_list[[compound_name]]  # ← line limits for glucose plot
+  ylims_b <- y_limits_box_list[[compound_name]]   # ← box limits for glucose plot
+  
+  samp <- samples_lac %>% filter(compound == compound_name)
+  summ <- samples_lac_summary %>% filter(compound == compound_name)
+  comp <- comparisons_lac %>% filter(compound == compound_name)
+  
+  p_l <- ggplot(summ, aes(x = timepoint, y = mean, color = screen_group, #line plot theme
+                           group = screen_group)) +
+    geom_ribbon(aes(ymin = mean-se, ymax = mean+se, fill = screen_group),
+                alpha = 0.15, color = NA) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.8) +
+    scale_x_discrete(labels = function(x) ifelse(tolower(x) == "baseline", "BL", x)) +
+    scale_y_continuous(limits = c(0, NA)) +
+    scale_y_continuous(limits = ylims_l) +  # ← apply lactose scale to glucose plot
+    labs(x = "Timepoint", y = "Amount / µg", color = "Study group", fill = "Study group") +
+    scale_color_manual(values = c("Controls" = "#8DA0CB",   # for lines and points <-- colors chosen from Dark2 in colorbrewer
+                                 "LMs"    = "#66C2A5",
+                                 "LIs"    = "#E78AC3")) +
+    scale_fill_manual(values  = c("Controls" = "#8DA0CB",   # for ribbons
+                                 "LMs"    = "#66C2A5",
+                                 "LIs"    = "#E78AC3")) +
+    theme_light(base_size = 15) +
+    theme(legend.position = if (show_legend) "bottom" else "none",
+    panel.grid       = element_blank(),
+    axis.title       = element_text(size = 19), 
+    axis.text        = element_text(size = 17.5)) 
+  
+  p_b <- ggplot(samp, aes(x = timepoint, y = value, fill = screen_group, #box plot theme
+                            group = interaction(timepoint, screen_group))) +
+    geom_boxplot(outlier.size = 0.8, linewidth = 0.6) +
+    geom_segment(data = comp,
+                 aes(x = xstart, xend = xend, y = yval, fill = NULL, group = NULL)) +
+    geom_text(data = comp,
+              aes(x = xlabel, y = ylabel, fill = NULL, group = NULL, label = p_adj.signif),
+              size = 5) +
+    scale_x_discrete(labels = function(x) ifelse(tolower(x) == "baseline", "BL", x)) +
+    scale_y_continuous(limits = ylims_b) + # ← apply lactose scale to glucose plot
+    labs(x = "Timepoint", y = "Amount / µg", fill = "Study group") +
+    scale_color_manual(values = c("Controls" = "#8DA0CB",   # for lines and points <-- colors chosen from Set2 in colorbrewer
+                                 "LMs"    = "#66C2A5",
+                                 "LIs"    = "#E78AC3")) +
+    scale_fill_manual(values  = c("Controls" = "#8DA0CB",   # for ribbons
+                                 "LMs"    = "#66C2A5",
+                                 "LIs"    = "#E78AC3")) +
+    theme_light(base_size = 15) +
+    theme(legend.position = if (show_legend) "bottom" else "none",
+    panel.grid       = element_blank(),
+    axis.title       = element_text(size = 17.5), 
+    axis.text        = element_text(size = 16)) 
+  
+  list(line = p_l, box = p_b)}
+
+# ── Build then add titles ──────────────────────────────────────────────────────
+
+plots <- lapply(compound_order, make_compound_plots)
+names(plots) <- compound_order
+
+for (cmp in compound_order) {
+  plots[[cmp]]$line <- plots[[cmp]]$line +
+    labs(title = compound_labels[[cmp]]) +
+    theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5))
+}
+
+# ── Assemble ───────────────────────────────────────────────────────────────────
+
+pair <- function(cmp) {
+  plots[[cmp]]$line + plots[[cmp]]$box + plot_layout(ncol = 2) &
+    theme(plot.margin = margin(5, 20, 5, 20))}
+
+p_final <- ((pair("lactose_ug") | pair("galactose_ug")) /
+            (pair("galactonate_ug") | pair("galactitol_ug"))) +
+  plot_layout(guides = "collect", axes = "collect", axis_titles = "collect") &
+  theme(axis.text.y = element_text(size = 14),
+        axis.title.x = element_text(margin = margin(t = 9)),
+        plot.margin   = margin(5, 10, 5, 10),
+        legend.position = "bottom",
+        legend.text      = element_text(size = 21),     
+        legend.title     = element_text(size = 21),  
+        legend.key.size  = unit(1, "cm"))
+
+p_final_with_title <- p_final + plot_annotation(
+  title = "Lactose, galactose, galactonate and galactitol profiles after lactose challenge",
+  theme = theme(plot.title = element_text(size = 30)))
+
+# ── Save ───────────────────────────────────────────────────────────────────────
+
+ggsave(file.path(pub_dir, "metabolites_box_line_lactose.png"), p_final_with_title, width = 16, height = 12,
+       dpi = 600, device = "png")
+
+```
+
+#### Comparison of differences from the baseline
+
+Out of interest, here's a rerun of above tests with BL-corrected values, which may remove some inter-individual variability.
+
+```{r diff_analysis_within_timepoint_bl_corr}
+# Test for significant differences between groups and timepoints
+## Kruskal wallis
+# Compare groups within a timepoint
+results = samples_diff %>%
+    filter(!is.na(treatment)) %>%
+    group_by(compound, timepoint, treatment) %>%
+    summarise(
+        p_value = kruskal.test(diff_to_bl ~ screen_group)$p.value,
+        .groups = "drop"
+    ) %>%
+    mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+    arrange(p_value)
+
+write.table(
+  results,
+  file.path(dea_dir, "diff_from_baseline_by_group.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+paged_table(results)
+```
+
+```{r message = FALSE, warning = FALSE}
+sig_res = results %>% filter(p_adj <= 0.05)
+
+samples_diff_posthoc = samples_diff %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  filter(compound %in% unique(sig_res$compound)) %>%
+  filter(timepoint %in% unique(sig_res$timepoint)) %>%
+  filter(treatment %in% unique(sig_res$treatment))
+
+post_hoc_results = samples_diff_posthoc %>%
+  filter(!is.na(treatment)) %>%
+  group_by(compound, timepoint, treatment) %>%
+  group_modify(~ {
+    # .x contains data for one compound × timepoint × treatment
+    test = dunnTest(diff_to_bl ~ screen_group, data = .x, method = "bh")
+    # extract pairwise comparisons
+    test$res %>%
+      as_tibble() %>%
+      rename(
+        comparison = Comparison,
+        p_value = P.unadj,
+        p_adj = P.adj
+      )
+  }) %>%
+  arrange(p_adj) %>%
+  add_significance(p.col = "p_adj") %>%
+  ungroup()
+
+write.table(
+  post_hoc_results,
+  file.path(dea_dir, "diff_from_baseline_by_group_posthoc.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+paged_table(post_hoc_results %>% filter(p_adj <= 0.05))
+```
+
+We see very similar results - in line with what we see in the PCA plot where BL samples are clustered together; differences at baseline are minor compared to the time-effect. In addition, running the model on the change from the baseline also resulted in galactose showing significant differences between groups.
+
+#### Comparison of time points within each group
+
+```{r diff_analysis_within_group}
+# Compare timepoints for each group
+results = samples_cr %>%
+    filter(!is.na(treatment)) %>%
+    group_by(compound, screen_group, treatment) %>%
+    summarise(
+        p_value = kruskal.test(value ~ timepoint)$p.value,
+        .groups = "drop"
+    ) %>%
+    mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+    arrange(p_value)
+
+write.table(
+  results,
+  file.path(dea_dir, "within_group_by_time.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r }
+paged_table(results)
+```
+
+```{r message = FALSE}
+sig_res = results %>% filter(p_adj <= 0.05)
+
+samples_cr_posthoc = samples_cr %>%
+  mutate(screen_group = factor(screen_group), timepoint = factor(timepoint, levels = c("Baseline", "0-3h", "3-6h"))) %>%
+  filter(compound %in% unique(sig_res$compound)) %>%
+  filter(screen_group %in% unique(sig_res$screen_group)) %>%
+  filter(treatment %in% unique(sig_res$treatment))
+
+post_hoc_results = samples_cr_posthoc %>%
+  filter(!is.na(treatment)) %>%
+  group_by(compound, screen_group, treatment) %>%
+  group_modify(~ {
+    # .x contains data for one compound × timepoint × treatment
+    test = dunnTest(value ~ timepoint, data = .x, method = "bh")
+    # extract pairwise comparisons
+    test$res %>%
+      as_tibble() %>%
+      rename(
+        comparison = Comparison,
+        p_value = P.unadj,
+        p_adj = P.adj
+      )
+  }) %>%
+  ungroup() %>%
+  add_significance(p.col = "p_adj") %>% 
+  arrange(p_adj)
+
+write.table(
+  post_hoc_results,
+  file.path(dea_dir, "within_group_by_time_posthoc.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+paged_table(post_hoc_results %>% filter(p_adj <= 0.05) %>% arrange(p_adj))
+```
+
+We get two very interesting results here:
+
+- Participants who got lactose show the expected trends.
+- Lactose intolerant participants (screen group 3) treated with glucose also show significant changes in the amounts of galactitol and galactonate over time. This is especially interesting because it suggests the potential for a new diagnostic method based on using glucose instead of lactose, which could avoid a lot of pain and discomfort for patients.
+
+```{r within_group_across_time, message = FALSE, warning = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+comparisons_ls = build_posthoc_plot(data = samples_cr, posthoc_results = post_hoc_results, sig_thr = 0.05, test = "groupwise")
+comparisons_df = do.call(rbind, comparisons_ls)
+
+within_group_by_time_plot = samples_cr %>%
+  filter(!is.na(treatment)) %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  ggplot(aes(x = screen_group, y = value, fill = timepoint, group = interaction(timepoint, screen_group))) +
+    geom_boxplot() +
+    geom_segment(data = comparisons_df, aes(x = xstart, xend = xend, y = yval, fill = NULL, group = NULL)) + 
+    geom_text(data = comparisons_df, aes(x = xlabel, y = ylabel, fill = NULL, group = NULL, label = p_adj.signif)) +
+    ggtitle("Distribution of metabolite values per study group, timepoint, and treatment") +
+    xlab("Timepoint") +
+    facet_grid(compound ~ treatment, scales = "free_y") +
+    theme_light() +
+    theme(legend.position = "bottom")
+
+ggsave(file.path(dea_dir, "poshthoc_groupwise_by_time_plot.pdf"), within_group_by_time_plot)
+within_group_by_time_plot
+```
+
+```{r message = FALSE, fig.align = "center"}
+glucose_treated_boxplot = samples_cr %>%
+  filter(treatment == "Glucose") %>%
+  mutate(screen_group = factor(screen_group)) %>%
+  ggplot(aes(x = screen_group, y = value, fill = timepoint, group = interaction(timepoint, screen_group))) +
+    geom_boxplot() +
+    geom_segment(data = comparisons_df[comparisons_df$treatment == "Glucose", ], aes(x = xstart, xend = xend, y = yval, fill = NULL, group = NULL)) + 
+    geom_text(data = comparisons_df[comparisons_df$treatment == "Glucose", ], aes(x = xlabel, y = ylabel, fill = NULL, group = NULL, label = p_adj.signif)) +
+    ggtitle("Distribution of metabolite values per study group, timepoint, and treatment in glucose-treated participants") +
+    xlab("Timepoint") +
+    ylab("Amount in ug") +
+    facet_grid(compound ~ ., scales = "free_y") +
+    theme_light() +
+    theme(legend.position = "bottom")
+
+patientwise_glucose_treated = samples_cr %>% 
+  filter(treatment == "Glucose") %>% 
+  ggplot(aes(x = timepoint, y = value, colour = screen_group, group = interaction(study_id))) + 
+    geom_line() + 
+    geom_point() + 
+    facet_grid(compound ~ ., scales = "free_y") +
+    guides(
+      color = guide_legend(title = "Screen group")
+    ) +
+    scale_color_manual(
+      values = c(
+        "Control" = "#619CFF",
+        "LM-A" = "#00BA38",
+        "LM-S" = "#F8766D"
+      )
+    ) +
+    theme_light()
+
+ggsave(file.path(dea_dir, "glucose_treated_boxplot.pdf"), glucose_treated_boxplot)
+ggsave(file.path(dea_dir, "patientwise_glucose_treated.pdf"), patientwise_glucose_treated)
+
+glucose_treated_boxplot
+patientwise_glucose_treated
+```
+
+### By genotype
+
+#### Comparison of groups within each time point
+
+We will now compare genotypes to see if we find any differences between them. The comparison of particular interest is TT to CT, since these are both classified as lactase persistent.
+
+```{r diff_analysis_within_timepoint_genotype, warning = FALSE}
+# Test for significant differences between groups and timepoints
+## Rank-based ANCOVA
+# Compare genotype groups within a timepoint
+samples_cr_genotype = samples_cr %>%
+  inner_join(mapping %>% select(study_id_lb, gen_test_rs4988235) %>% distinct(), by = join_by("study_id" == "study_id_lb")) %>%
+  filter(!is.na(gen_test_rs4988235))
+
+results = samples_cr_genotype %>%
+    filter(!is.na(treatment)) %>%
+      mutate(sex = factor(sex)) %>%
+    group_by(compound, timepoint, treatment) %>%
+    summarise(p_value = {df_sub <- cur_data() %>% mutate(rank_value = rank(value))
+            fit <- lm(rank_value ~ gen_test_rs4988235 + sex, data = df_sub)
+            anova(fit)["gen_test_rs4988235", "Pr(>F)"]},
+        .groups = "drop"
+    ) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+    arrange(p_value)
+
+write.table(
+  results,
+  file.path(dea_dir, "within_timepoint_by_genotype.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r }
+paged_table(results %>% filter(p_adj <= 0.5))
+```
+
+```{r, message = FALSE, warning = FALSE}
+library(emmeans)
+sig_res <- results %>% filter(p_adj <= 0.05)
+samples_cr_posthoc <- samples_cr_genotype %>%
+  mutate(gen_test_rs4988235 = factor(gen_test_rs4988235)) %>%
+  filter(!is.na(treatment)) %>%
+  semi_join(sig_res, by = c("compound", "timepoint", "treatment"))
+post_hoc_results <- samples_cr_posthoc %>%
+  group_by(compound, timepoint, treatment) %>%
+  group_modify(~ {
+    df_sub <- .x %>% mutate(rank_value = rank(value))
+    fit <- lm(rank_value ~ gen_test_rs4988235 + sex, data = df_sub)
+    emm <- emmeans(fit, pairwise ~ gen_test_rs4988235)
+    # raw pairwise p-values from the covariate-adjusted contrasts
+    summary(emm$contrasts, adjust = "none") %>%
+      as_tibble() %>%
+      transmute(
+        comparison = contrast,
+        estimate,
+        SE,
+        df,
+        t.ratio,
+        p_value = p.value
+      ) %>%
+      mutate(p_adj = p.adjust(p_value, method = "BH"))
+  }) %>%
+  ungroup() %>%
+  arrange(p_adj) %>%
+  add_significance(p.col = "p_adj")
+
+write.table(
+  post_hoc_results,
+  file.path(dea_dir, "within_timepoint_by_genotype_posthoc.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+paged_table(post_hoc_results %>% arrange(p_adj) %>% filter(p_adj <= 0.05))
+```
+
+```{r, message = FALSE, fig.align = "center", fig.height = 8}
+comparisons_ls = build_posthoc_plot(samples_cr_genotype, post_hoc_results, sig_thr = 0.05, test = "timewise", plot_col = "gen_test_rs4988235")
+comparisons_df = do.call(rbind, comparisons_ls)
+
+posthoc_genotype_wise_by_time = samples_cr_genotype %>%
+  filter(!is.na(treatment)) %>%
+  mutate(gen_test_rs4988235 = factor(gen_test_rs4988235)) %>%
+  ggplot(aes(x = timepoint, y = value, fill = gen_test_rs4988235, group = interaction(timepoint, gen_test_rs4988235))) +
+    geom_boxplot() +
+    geom_segment(data = comparisons_df, aes(x = xstart, xend = xend, y = yval, fill = NULL, group = NULL)) + 
+    geom_text(data = comparisons_df, aes(x = xlabel, y = ylabel, fill = NULL, group = NULL, label = p_adj.signif)) +
+    ggtitle("Distribution of metabolite values per study group, timepoint, and treatment") +
+    xlab("Timepoint") +
+    ylab("Amount in ug") +
+    facet_grid(compound ~ treatment, scales = "free_y") +
+    guides(
+      fill = guide_legend(title = "Genotype")
+    ) +
+    scale_fill_manual(
+      values = c(
+        "TT" = "#619CFF",
+        "CT" = "#00BA38",
+        "CC" = "#F8766D"
+      )
+    ) +
+    theme_light() +
+    theme(legend.position = "bottom")
+
+ggsave(file.path(dea_dir, "posthoc_genotype_wise_by_time.pdf"), posthoc_genotype_wise_by_time)
+posthoc_genotype_wise_by_time
+```
+
+```{r, fig.align = "center", fig.height = 8}
+
+library(patchwork)
+
+# ── Build post-hoc comparisons ─────────────────────────────────────────────────
+comparisons_ls <- build_posthoc_plot(samples_cr_genotype, post_hoc_results, sig_thr = 0.05, test = "timewise", plot_col = "gen_test_rs4988235")
+comparisons_df <- do.call(rbind, comparisons_ls)
+
+# ── Setup for plot ─────────────────────────────────────────────────────────────
+
+compound_order <- c("lactose_ug", "galactose_ug", "galactonate_ug", "galactitol_ug")
+compound_labels <- c("lactose_ug"     = "Lactose",
+                     "galactose_ug"   = "Galactose",
+                     "galactonate_ug" = "Galactonate",
+                     "galactitol_ug"  = "Galactitol")
+
+samples_gen <- samples_cr_genotype %>%
+  filter(!is.na(treatment), treatment == "Lactose") %>%
+  mutate(gen_test_rs4988235 = factor(gen_test_rs4988235,
+                                      levels = c("TT", "CT", "CC")),
+         compound = factor(compound, levels = compound_order))
+
+comparisons_gen <- comparisons_df %>%
+  mutate(compound = factor(compound, levels = compound_order))
+
+samples_gen_summary <- samples_gen %>%
+  group_by(compound, timepoint, gen_test_rs4988235) %>%
+  summarise(mean   = mean(value, na.rm = TRUE),
+            median = median(value, na.rm = TRUE),
+            q25    = quantile(value, 0.25, na.rm = TRUE),
+            q75    = quantile(value, 0.75, na.rm = TRUE),
+            se     = sd(value, na.rm = TRUE)/sqrt(n()),
+            .groups = "drop") %>%
+  mutate(compound = factor(compound, levels = compound_order))
+
+# ── Helper ─────────────────────────────────────────────────────────────────────
+
+make_compound_plots_gen <- function(compound_name, show_legend = FALSE) {
+  
+  samp <- samples_gen %>% filter(compound == compound_name)
+  summ <- samples_gen_summary %>% filter(compound == compound_name)
+  comp <- comparisons_gen %>% filter(compound == compound_name)
+  
+  p_l <- ggplot(summ, aes(x = timepoint, y = mean, color = gen_test_rs4988235,
+                           group = gen_test_rs4988235)) +
+    geom_ribbon(aes(ymin = mean-se, ymax = mean+se, fill = gen_test_rs4988235),
+                alpha = 0.15, color = NA) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.8) +
+    scale_x_discrete(labels = function(x) ifelse(tolower(x) == "baseline", "BL", x)) +
+    scale_y_continuous(limits = c(0, NA)) +
+    labs(x = "Timepoint", y = "Amount / µg", color = "Genotype", fill = "Genotype") +
+    scale_color_manual(values = c("TT" = "#FC8D62",
+                                   "CT" = "#FFD92F",
+                                   "CC" = "#B3B3B3")) +
+    scale_fill_manual(values  = c("TT" = "#FC8D62",
+                                   "CT" = "#FFD92F",
+                                   "CC" = "#B3B3B3")) +
+    theme_light(base_size = 15) +
+    theme(legend.position = if (show_legend) "bottom" else "none",
+          panel.grid      = element_blank(),
+    axis.title       = element_text(size = 19), 
+    axis.text        = element_text(size = 17.5)) 
+
+  p_b <- ggplot(samp, aes(x = timepoint, y = value, fill = gen_test_rs4988235,
+                            group = interaction(timepoint, gen_test_rs4988235))) +
+    geom_boxplot(outlier.size = 0.8, linewidth = 0.4) +
+    geom_segment(data = comp,
+                 aes(x = xstart, xend = xend, y = yval, fill = NULL, group = NULL)) +
+    geom_text(data = comp,
+              aes(x = xlabel, y = ylabel, fill = NULL, group = NULL, label = p_adj.signif),
+              size = 3) +
+    scale_x_discrete(labels = function(x) ifelse(tolower(x) == "baseline", "BL", x)) +
+    labs(x = "Timepoint", y = "Amount / µg", fill = "Genotype") +
+    scale_fill_manual(values = c("TT" = "#FC8D62",
+                                  "CT" = "#FFD92F",
+                                  "CC" = "#B3B3B3")) +
+    theme_light(base_size = 15) +
+    theme(legend.position = if (show_legend) "bottom" else "none",
+          panel.grid      = element_blank(),
+    axis.title       = element_text(size = 17.5), 
+    axis.text        = element_text(size = 16))
+  
+  list(line = p_l, box = p_b)
+}
+
+# ── Build then add titles ──────────────────────────────────────────────────────
+
+plots_gen <- lapply(compound_order, make_compound_plots_gen)
+names(plots_gen) <- compound_order
+
+for (cmp in compound_order) {
+  plots_gen[[cmp]]$line <- plots_gen[[cmp]]$line +
+    labs(title = compound_labels[[cmp]]) +
+    theme(plot.title = element_text(face = "bold", size = 20, hjust = 0.5))
+}
+
+# ── Assemble ───────────────────────────────────────────────────────────────────
+
+pair_gen <- function(cmp) {
+  plots_gen[[cmp]]$line + plots_gen[[cmp]]$box + plot_layout(ncol = 2) &
+    theme(plot.margin = margin(5, 20, 5, 20))
+}
+
+p_final_gen <- ((pair_gen("lactose_ug") | pair_gen("galactose_ug")) /
+                (pair_gen("galactonate_ug") | pair_gen("galactitol_ug"))) +
+  plot_layout(guides = "collect", axes = "collect", axis_titles = "collect") &  
+  theme(axis.text.y   = element_text(size = 14),
+        axis.title.x  = element_text(margin = margin(t = 9)),
+        plot.margin   = margin(5, 10, 5, 10),
+        legend.position = "bottom",
+        legend.text   = element_text(size = 21),
+        legend.title  = element_text(size = 21),
+        legend.key.size = unit(1, "cm"))
+
+p_final_gen_with_title <- p_final_gen + plot_annotation(
+  title = "Lactose, galactose, galactonate and galactitol profiles by genotype",
+  theme = theme(plot.title = element_text(size = 30)))
+
+# ── Save ───────────────────────────────────────────────────────────────────────
+
+ggsave(file.path(pub_dir, "metabolites_box_line_genotype.png"), p_final_gen_with_title, width = 16, height = 12,
+       dpi = 600, device = "png")
+```
+
+```{r}
+paged_table(results)
+```
+
+
+#### Comparison of time points within each group
+
+```{r diff_analysis_within_group_genotype}
+# Compare timepoints for each group
+results = samples_cr_genotype %>%
+    filter(!is.na(treatment)) %>%
+    group_by(compound, gen_test_rs4988235, treatment) %>%
+    summarise(
+        p_value = kruskal.test(value ~ timepoint)$p.value,
+        .groups = "drop"
+    ) %>%
+    mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+    arrange(p_value)
+
+write.table(
+  results,
+  file.path(dea_dir, "within_genotype_by_time.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r }
+paged_table(results)
+```
+
+```{r message = FALSE}
+sig_res = results %>% filter(p_adj <= 0.05)
+
+samples_cr_posthoc = samples_cr_genotype %>%
+  mutate(gen_test_rs4988235 = factor(gen_test_rs4988235), timepoint = factor(timepoint, levels = c("Baseline", "0-3h", "3-6h"))) %>%
+  filter(compound %in% unique(sig_res$compound)) %>%
+  filter(gen_test_rs4988235 %in% unique(sig_res$gen_test_rs4988235)) %>%
+  filter(treatment %in% unique(sig_res$treatment))
+
+post_hoc_results = samples_cr_posthoc %>%
+  filter(!is.na(treatment)) %>%
+  group_by(compound, gen_test_rs4988235, treatment) %>%
+  group_modify(~ {
+    # .x contains data for one compound × timepoint × treatment
+    test = dunnTest(value ~ timepoint, data = .x, method = "bh")
+    # extract pairwise comparisons
+    test$res %>%
+      as_tibble() %>%
+      rename(
+        comparison = Comparison,
+        p_value = P.unadj,
+        p_adj = P.adj
+      )
+  }) %>%
+  ungroup() %>%
+  arrange(p_adj) %>%
+  add_significance(p.col = "p_adj")
+
+write.table(
+  post_hoc_results,
+  file.path(dea_dir, "within_genotype_by_time_posthoc.tsv"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+paged_table(post_hoc_results %>% filter(p_adj <= 0.05))
+```
+
+```{r within_group_across_time_genotype, message = FALSE, warning = FALSE, fig.height = 8, fig.width = 8, fig.align = "center"}
+comparisons_ls = build_posthoc_plot(data = samples_cr_genotype, posthoc_results = post_hoc_results, sig_thr = 0.05, test = "groupwise", plot_col = "gen_test_rs4988235")
+comparisons_df = do.call(rbind, comparisons_ls)
+
+posthoc_timewise_by_genotype = samples_cr_genotype %>%
+  filter(!is.na(treatment)) %>%
+  mutate(gen_test_rs4988235 = factor(gen_test_rs4988235)) %>%
+  ggplot(aes(x = gen_test_rs4988235, y = value, fill = timepoint)) +
+    geom_boxplot() +
+    geom_segment(data = comparisons_df, aes(x = xstart, xend = xend, y = yval, fill = NULL, group = NULL)) + 
+    geom_text(data = comparisons_df, aes(x = xlabel, y = ylabel, fill = NULL, group = NULL, label = p_adj.signif)) +
+    ggtitle("Distribution of metabolite values per genotype, timepoint, and treatment") +
+    xlab("Timepoint") +
+    facet_grid(compound ~ treatment, scales = "free_y") +
+    theme_light() +
+    theme(legend.position = "bottom")
+
+ggsave(file.path(dea_dir, "posthoc_timewise_by_genotype.pdf"), posthoc_timewise_by_genotype)
+posthoc_timewise_by_genotype
+```
+
+## Non-parametric longitudinal test (nparLD) by screen group {.tabset}
+
+### Lactose
+
+```{r nparld_lactose, message = FALSE, warning = FALSE}
+library(tibble)
+
+df = samples_cr %>%
+  filter(compound == "lactose_ug")
+
+df$treatment = relevel(df$treatment, ref = "Glucose")
+df$timepoint = factor(as.numeric(df$timepoint))
+
+model = f2.ld.f1(
+  y = df$value,
+  time = df$timepoint,
+  group1 = df$screen_group,
+  group2 = df$treatment,
+  subject = df$study_id,
+  group1.name = "Screen group",
+  group2.name = "Treatment",
+  time.order = c(1,2,3)
+)
+
+paged_table(model$RTE)
+paged_table(model$ANOVA.test)
+paged_table(model$ANOVA.test.mod.Box)
+
+ats_lactose <- as.data.frame(model$ANOVA.test) %>%
+  rownames_to_column("term") %>%
+  mutate(p_adj = p.adjust(`p-value`, method = "BH"))
+
+paged_table(ats_lactose)
+```
+
+### Galactose
+
+```{r nparld_galactose, message = FALSE, warning = FALSE}
+df = samples_cr %>%
+  filter(compound == "galactose_ug")
+
+df$treatment = relevel(df$treatment, ref = "Glucose")
+df$timepoint = factor(as.numeric(df$timepoint))
+
+model = f2.ld.f1(
+  y = df$value,
+  time = df$timepoint,
+  group1 = df$screen_group,
+  group2 = df$treatment,
+  subject = df$study_id,
+  group1.name = "Screen group",
+  group2.name = "Treatment",
+  time.order = c(1,2,3)
+)
+
+paged_table(model$RTE)
+paged_table(model$ANOVA.test)
+paged_table(model$ANOVA.test.mod.Box)
+
+ats_galactose <- as.data.frame(model$ANOVA.test) %>%
+  rownames_to_column("term") %>%
+  mutate(p_adj = p.adjust(`p-value`, method = "BH"))
+
+paged_table(ats_galactose)
+```
+
+### Galactitol
+
+```{r nparld_galactitol, message = FALSE, warning = FALSE}
+df = samples_cr %>%
+  filter(compound == "galactitol_ug")
+
+df$treatment = relevel(df$treatment, ref = "Glucose")
+df$timepoint = factor(as.numeric(df$timepoint))
+
+model = f2.ld.f1(
+  y = df$value,
+  time = df$timepoint,
+  group1 = df$screen_group,
+  group2 = df$treatment,
+  subject = df$study_id,
+  group1.name = "Screen group",
+  group2.name = "Treatment",
+  time.order = c(1,2,3)
+)
+
+paged_table(model$RTE)
+paged_table(model$ANOVA.test)
+paged_table(model$ANOVA.test.mod.Box)
+
+ats_galactitol <- as.data.frame(model$ANOVA.test) %>%
+  rownames_to_column("term") %>%
+  mutate(p_adj = p.adjust(`p-value`, method = "BH"))
+
+paged_table(ats_galactitol)
+```
+
+### Galactonate
+
+```{r nparld_galactonate, message = FALSE, warning = FALSE}
+df = samples_cr %>%
+  filter(compound == "galactonate_ug")
+
+df$treatment = relevel(df$treatment, ref = "Glucose")
+df$timepoint = factor(as.numeric(df$timepoint))
+
+model = f2.ld.f1(
+  y = df$value,
+  time = df$timepoint,
+  group1 = df$screen_group,
+  group2 = df$treatment,
+  subject = df$study_id,
+  group1.name = "Screen group",
+  group2.name = "Treatment",
+  time.order = c(1,2,3)
+)
+
+paged_table(model$RTE)
+paged_table(model$ANOVA.test)
+paged_table(model$ANOVA.test.mod.Box)
+
+ats_galactonate <- as.data.frame(model$ANOVA.test) %>%
+  rownames_to_column("term") %>%
+  mutate(p_adj = p.adjust(`p-value`, method = "BH"))
+
+paged_table(ats_galactonate)
+
+```
+
+## Non-parametric longitudinal test (nparLD) by genotype {.tabset}
+
+### Lactose
+
+```{r nparld_lactose_genotype, message = FALSE, warning = FALSE}
+df = samples_cr_genotype %>%
+  filter(compound == "lactose_ug")
+
+df$treatment = relevel(df$treatment, ref = "Glucose")
+df$timepoint = factor(as.numeric(df$timepoint))
+
+model = f2.ld.f1(
+  y = df$value,
+  time = df$timepoint,
+  group1 = df$gen_test_rs4988235,
+  group2 = df$treatment,
+  subject = df$study_id,
+  group1.name = "Genotype",
+  group2.name = "Treatment",
+  time.order = c(1,2,3)
+)
+
+paged_table(model$RTE)
+paged_table(model$ANOVA.test)
+paged_table(model$ANOVA.test.mod.Box)
+```
+
+### Galactose
+
+```{r nparld_galactose_genotype, message = FALSE, warning = FALSE}
+df = samples_cr_genotype %>%
+  filter(compound == "galactose_ug")
+
+df$treatment = relevel(df$treatment, ref = "Glucose")
+df$timepoint = factor(as.numeric(df$timepoint))
+
+model = f2.ld.f1(
+  y = df$value,
+  time = df$timepoint,
+  group1 = df$gen_test_rs4988235,
+  group2 = df$treatment,
+  subject = df$study_id,
+  group1.name = "Genotype",
+  group2.name = "Treatment",
+  time.order = c(1,2,3)
+)
+
+paged_table(model$RTE)
+paged_table(model$ANOVA.test)
+paged_table(model$ANOVA.test.mod.Box)
+```
+
+### Galactitol
+
+```{r nparld_galactitol_genotype, message = FALSE, warning = FALSE}
+df = samples_cr_genotype %>%
+  filter(compound == "galactitol_ug")
+
+df$treatment = relevel(df$treatment, ref = "Glucose")
+df$timepoint = factor(as.numeric(df$timepoint))
+
+model = f2.ld.f1(
+  y = df$value,
+  time = df$timepoint,
+  group1 = df$gen_test_rs4988235,
+  group2 = df$treatment,
+  subject = df$study_id,
+  group1.name = "Genotype",
+  group2.name = "Treatment",
+  time.order = c(1,2,3)
+)
+
+paged_table(model$RTE)
+paged_table(model$ANOVA.test)
+paged_table(model$ANOVA.test.mod.Box)
+```
+
+### Galactonate
+
+```{r nparld_galactonate_genotype, message = FALSE, warning = FALSE}
+df = samples_cr_genotype %>%
+  filter(compound == "galactonate_ug")
+
+df$treatment = relevel(df$treatment, ref = "Glucose")
+df$timepoint = factor(as.numeric(df$timepoint))
+
+model = f2.ld.f1(
+  y = df$value,
+  time = df$timepoint,
+  group1 = df$gen_test_rs4988235,
+  group2 = df$treatment,
+  subject = df$study_id,
+  group1.name = "Genotype",
+  group2.name = "Treatment",
+  time.order = c(1,2,3)
+)
+
+paged_table(model$RTE)
+paged_table(model$ANOVA.test)
+paged_table(model$ANOVA.test.mod.Box)
+```
