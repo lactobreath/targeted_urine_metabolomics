@@ -1,5 +1,6 @@
 .DS_Store
 results/*
+results/.DS_Store
 
 # History files
 .Rhistory
