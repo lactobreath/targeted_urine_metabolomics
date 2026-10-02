@@ -11,3 +11,11 @@ The repository contains a series of scripts to run the different analyses and pr
 - `Multivariate_analysis_study_group_with_sex.R`: LDA of urinary lactose metabolite levels to discriminate study groups.
 - `ROC_curves_metabolites_h2_3_pools_with_sex.R`: ROC curve analysis of urinary lactose metabolite levels to discriminate study groups.
 - `Symptoms_correlation_final.R`: correlation analysis between urinary lactose metabolites and gastrointestinal symptoms.
+
+## Reproducibility
+
+We set up an `renv` project in order to facilitate the reproduction of the results. In order to use it, please install the `renv` R package and run the following:
+
+```
+renv::restore()
+```
